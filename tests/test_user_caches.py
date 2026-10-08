@@ -1,11 +1,14 @@
 import os
-import unittest
+from dataclasses import replace
 from pathlib import Path
+import unittest
+from unittest.mock import patch
 
 from scripts.mac_cleanup.models import Risk
 from scripts.mac_cleanup.modules.base import ScanContext
 from scripts.mac_cleanup.modules.registry import registered_modules
 from scripts.mac_cleanup.modules.user_caches import UserCachesModule
+from scripts.mac_cleanup.paths import inspect_path
 from scripts.mac_cleanup.process import ProcessRunner
 from tests.fixtures import fake_home
 
@@ -57,6 +60,58 @@ class UserCachesModuleTest(unittest.TestCase):
         self.assertNotIn(str(self.home / "Library" / "Application Support"), proposed_paths)
         self.assertNotIn(str(self.home / ".env"), proposed_paths)
         self.assertNotIn(str(self.home / "project"), proposed_paths)
+        self.assertEqual(result.executable_target_ids, (candidate.id,))
+
+    def test_fast_scan_does_not_recursively_inspect_a_problematic_child(self) -> None:
+        cache_root = self.home / "Library" / "Caches"
+        os.symlink(self.home / "project", cache_root / "com.example.app" / "nested-link")
+
+        with patch(
+            "scripts.mac_cleanup.modules.user_caches.inspect_path",
+            side_effect=AssertionError("fast scan must not inspect recursively"),
+        ):
+            result = self.module.fast_scan(self.context)
+
+        candidate = next(target for target in result.targets if target.id == "user-caches:com.example.app")
+        self.assertEqual(candidate.logical_bytes, (cache_root / "com.example.app").lstat().st_size)
+        self.assertEqual(candidate.fingerprint, "")
+        self.assertEqual(result.executable_target_ids, ())
+
+    def test_deep_scan_recursively_inspects_only_selected_candidate_ids(self) -> None:
+        fast = self.module.fast_scan(self.context)
+        selected = next(target for target in fast.targets if target.id == "user-caches:com.example.app")
+
+        with patch(
+            "scripts.mac_cleanup.modules.user_caches.inspect_path", wraps=inspect_path
+        ) as inspected:
+            result = self.module.deep_scan(self.context, (selected.id,))
+
+        inspected.assert_called_once_with(
+            self.home / "Library" / "Caches" / "com.example.app",
+            (self.home / "Library" / "Caches",),
+        )
+        self.assertEqual(result.executable_target_ids, (selected.id,))
+
+    def test_deep_scan_observes_the_threshold_boundary(self) -> None:
+        selected = "user-caches:com.example.app"
+        at_threshold = replace(self.context, deep_scan_threshold=5)
+        above_threshold = replace(self.context, deep_scan_threshold=6)
+
+        self.assertEqual(
+            [target.id for target in self.module.deep_scan(at_threshold, (selected,)).targets],
+            [selected],
+        )
+        self.assertEqual(self.module.deep_scan(above_threshold, (selected,)).targets, ())
+
+    def test_root_scandir_failure_is_reported_instead_of_looking_empty(self) -> None:
+        with patch(
+            "scripts.mac_cleanup.modules.user_caches.os.scandir",
+            side_effect=PermissionError("denied"),
+        ):
+            result = self.module.fast_scan(self.context)
+
+        self.assertEqual(result.targets, ())
+        self.assertEqual([issue.code for issue in result.issues], ["user-caches.cache-root-unreadable"])
 
     def test_deep_scan_does_not_accept_path_like_or_unknown_candidate_ids(self) -> None:
         result = self.module.deep_scan(

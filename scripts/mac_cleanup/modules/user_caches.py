@@ -26,9 +26,13 @@ class UserCachesModule:
         root, issues = self._usable_root(context)
         if root is None:
             return ScanResult(issues=issues)
+        names, scan_issue = _child_names(root)
+        if scan_issue is not None:
+            issues.append(scan_issue)
+            return ScanResult(issues=tuple(issues))
         targets: list[Target] = []
-        for name in _child_names(root):
-            target, issue = self._inspect_candidate(context, root, name)
+        for name in names:
+            target, issue = self._inspect_shallow_candidate(context, root, name)
             if target is not None:
                 targets.append(target)
             if issue is not None:
@@ -42,18 +46,26 @@ class UserCachesModule:
         root, issues = self._usable_root(context)
         if root is None:
             return ScanResult(issues=issues)
-        available_names = set(_child_names(root))
+        names, scan_issue = _child_names(root)
+        if scan_issue is not None:
+            issues.append(scan_issue)
+            return ScanResult(issues=tuple(issues))
+        available_names = set(names)
         targets: list[Target] = []
         for candidate_id in sorted(set(candidate_ids)):
             name = self._candidate_name(candidate_id)
             if name is None or name not in available_names:
                 continue
-            target, issue = self._inspect_candidate(context, root, name)
+            target, issue = self._inspect_deep_candidate(context, root, name)
             if target is not None and target.logical_bytes >= context.deep_scan_threshold:
                 targets.append(target)
             if issue is not None:
                 issues.append(issue)
-        return ScanResult(targets=tuple(targets), issues=tuple(issues))
+        return ScanResult(
+            targets=tuple(targets),
+            issues=tuple(issues),
+            executable_target_ids=tuple(target.id for target in targets),
+        )
 
     def _cache_root(self, context: ScanContext) -> Path:
         return context.home / "Library" / "Caches"
@@ -72,7 +84,30 @@ class UserCachesModule:
             return None
         return name
 
-    def _inspect_candidate(
+    def _inspect_shallow_candidate(
+        self, context: ScanContext, root: Path, name: str
+    ) -> tuple[Target | None, Issue | None]:
+        """Capture only immediate-entry metadata; never walk a candidate tree."""
+        if not _is_allowed_name(name):
+            return None, None
+        candidate = root / name
+        if not _safe_entry(candidate):
+            return None, _warning("candidate-unavailable", candidate)
+        try:
+            candidate_stat = candidate.lstat()
+        except OSError:
+            return None, _warning("candidate-unavailable", candidate)
+        if candidate_stat.st_uid != context.uid:
+            return None, _warning("candidate-not-owned", candidate)
+        return Target(
+            id=f"{self._TARGET_PREFIX}{name}",
+            path=str(candidate),
+            kind=_kind(candidate_stat),
+            risk=_risk_for(name),
+            logical_bytes=candidate_stat.st_size,
+        ), None
+
+    def _inspect_deep_candidate(
         self, context: ScanContext, root: Path, name: str
     ) -> tuple[Target | None, Issue | None]:
         if not _is_allowed_name(name):
@@ -99,12 +134,16 @@ class UserCachesModule:
         )
 
 
-def _child_names(root: Path) -> tuple[str, ...]:
+def _child_names(root: Path) -> tuple[tuple[str, ...], Issue | None]:
     try:
         with os.scandir(root) as entries:
-            return tuple(sorted(entry.name for entry in entries if _is_allowed_name(entry.name)))
-    except OSError:
-        return ()
+            return tuple(sorted(entry.name for entry in entries if _is_allowed_name(entry.name))), None
+    except OSError as error:
+        return (), Issue(
+            code="user-caches.cache-root-unreadable",
+            severity=Severity.WARNING,
+            message=f"Cannot enumerate approved cache root: {root}: {error}",
+        )
 
 
 def _safe_directory(path: Path) -> bool:
@@ -131,6 +170,10 @@ def _safe_entry(path: Path) -> bool:
         return False
     access = os.R_OK | (os.X_OK if stat.S_ISDIR(path_stat.st_mode) else 0)
     return _has_no_symlink_components(path) and os.access(path, access)
+
+
+def _kind(path_stat: os.stat_result) -> str:
+    return "directory" if stat.S_ISDIR(path_stat.st_mode) else "file"
 
 
 def _has_no_symlink_components(path: Path) -> bool:

@@ -39,10 +39,23 @@ class ScanResult:
 
     targets: tuple[Target, ...] = field(default_factory=tuple)
     issues: tuple[Issue, ...] = field(default_factory=tuple)
+    executable_target_ids: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "targets", tuple(sorted(self.targets, key=lambda target: target.id)))
+        targets = tuple(sorted(self.targets, key=lambda target: target.id))
+        executable_target_ids = tuple(sorted(set(self.executable_target_ids)))
+        target_ids = {target.id for target in targets}
+        if not set(executable_target_ids).issubset(target_ids):
+            raise ValueError("executable target ids must be present in scan targets")
+        object.__setattr__(self, "targets", targets)
         object.__setattr__(self, "issues", tuple(self.issues))
+        object.__setattr__(self, "executable_target_ids", executable_target_ids)
+
+    @property
+    def executable_targets(self) -> tuple[Target, ...]:
+        """Return only recursively inspected targets safe for later approval."""
+        executable_ids = set(self.executable_target_ids)
+        return tuple(target for target in self.targets if target.id in executable_ids)
 
 
 class CleanupModule(Protocol):
