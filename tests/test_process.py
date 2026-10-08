@@ -1,7 +1,7 @@
 import sys
 import unittest
 
-from scripts.mac_cleanup.process import ProcessRunner, ToolResolver
+from scripts.mac_cleanup.process import OperationMode, ProcessRunner, ToolResolver
 
 
 class ProcessTest(unittest.TestCase):
@@ -38,18 +38,34 @@ class ProcessTest(unittest.TestCase):
         self.assertIsNotNone(ToolResolver().resolve(sys.executable))
 
     def test_scan_disallows_known_side_effecting_commands(self) -> None:
-        for argv in (("open", "/tmp/example"), ("adb", "devices"), ("brew", "cleanup")):
-            result = ProcessRunner().run(argv, timeout_seconds=1, mutation=True)
+        for argv in (
+            ("open", "/tmp/example"),
+            ("adb", "-P", "5037", "devices"),
+            ("env", "adb", "devices"),
+            ("brew", "cleanup"),
+            ("npm", "cache", "clean", "--force"),
+            ("yarn", "cache", "clean"),
+            ("pip", "cache", "purge"),
+        ):
+            result = ProcessRunner().run(argv, timeout_seconds=1, mutation=False)
             self.assertTrue(result.disallowed, argv)
             self.assertIsNone(result.exit_code)
 
     def test_dry_run_package_cleanup_is_allowed_to_execute(self) -> None:
         result = ProcessRunner().run(
-            (sys.executable, "-c", "print('dry')", "--dry-run"),
-            timeout_seconds=1,
-            mutation=False,
+            ("brew", "cleanup", "--dry-run"), timeout_seconds=1
         )
         self.assertFalse(result.disallowed)
+
+    def test_approved_mutation_mode_can_execute_a_command(self) -> None:
+        result = ProcessRunner().run(
+            (sys.executable, "-c", "print('approved')"),
+            timeout_seconds=1,
+            mode=OperationMode.APPROVED_MUTATION,
+        )
+        self.assertFalse(result.disallowed)
+        self.assertTrue(result.mutation)
+        self.assertEqual(result.stdout.strip(), "approved")
 
 
 if __name__ == "__main__":

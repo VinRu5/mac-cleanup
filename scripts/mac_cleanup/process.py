@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,11 @@ from collections.abc import Sequence
 
 class CommandTimeout(RuntimeError):
     """Describes a process which exceeded its caller-supplied timeout."""
+
+
+class OperationMode(str, Enum):
+    SCAN = "scan"
+    APPROVED_MUTATION = "approved_mutation"
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,7 @@ class ProcessRunner:
         argv: Sequence[str],
         timeout_seconds: float,
         mutation: bool = False,
+        mode: OperationMode | str | None = None,
     ) -> CommandResult:
         if isinstance(argv, (str, bytes)):
             raise TypeError("commands must be provided as an argv sequence")
@@ -63,7 +70,9 @@ class ProcessRunner:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
-        forbidden = _disallowed_reason(command, mutation)
+        operation_mode = _mode(mode, mutation)
+        mutation = operation_mode is OperationMode.APPROVED_MUTATION
+        forbidden = _disallowed_reason(command, operation_mode)
         if forbidden is not None:
             return CommandResult(
                 argv=command, exit_code=None, stdout="", stderr=forbidden,
@@ -108,16 +117,83 @@ def _output_text(value: str | bytes | None) -> str:
     return value.decode(errors="replace") if isinstance(value, bytes) else value
 
 
-def _disallowed_reason(argv: tuple[str, ...], mutation: bool) -> str | None:
-    executable = os.path.basename(argv[0])
-    args = tuple(item.lower() for item in argv[1:])
+def _mode(mode: OperationMode | str | None, mutation: bool) -> OperationMode:
+    if mode is None:
+        return OperationMode.APPROVED_MUTATION if mutation else OperationMode.SCAN
+    try:
+        return OperationMode(mode)
+    except ValueError as error:
+        raise ValueError(f"unsupported operation mode: {mode}") from error
+
+
+def _unwrap(argv: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    """Return the real executable and args for common command wrappers."""
+    index = 0
+    while index < len(argv):
+        name = os.path.basename(argv[index])
+        if name == "env":
+            index += 1
+            while index < len(argv) and (argv[index].startswith("-") or "=" in argv[index]):
+                index += 1
+            continue
+        if name in {"sudo", "command", "exec"}:
+            index += 1
+            while index < len(argv) and argv[index].startswith("-"):
+                index += 1
+            continue
+        break
+    if index >= len(argv):
+        return "", ()
+    return os.path.basename(argv[index]), argv[index + 1:]
+
+
+def _disallowed_reason(argv: tuple[str, ...], mode: OperationMode) -> str | None:
+    executable, raw_args = _unwrap(argv)
+    args = tuple(item.lower() for item in raw_args)
+    if mode is not OperationMode.SCAN:
+        return None
     if executable == "open":
         return "open is disallowed during scans"
-    if executable == "adb" and args[:1] == ("devices",):
-        return "adb devices is disallowed during scans"
+    if executable == "adb":
+        # adb accepts global options before its subcommand.
+        if "devices" in args:
+            return "adb devices is disallowed during scans"
     package_tools = {"brew", "npm", "pnpm", "yarn", "pip", "pip3"}
-    package_actions = {"cleanup", "autoremove", "prune", "remove", "uninstall"}
-    if executable in package_tools and package_actions.intersection(args):
-        if "--dry-run" not in args and "--dryrun" not in args:
-            return "non-dry-run package cleanup is disallowed during scans"
+    if executable not in package_tools:
+        return None
+    if _package_cleanup(executable, args) and not _explicit_dry_run(args):
+        return "non-dry-run package cleanup is disallowed during scans"
+    if not _package_scan_allowed(executable, args):
+        return "unrecognized package command is disallowed during scans"
     return None
+
+
+def _explicit_dry_run(args: tuple[str, ...]) -> bool:
+    return "--dry-run" in args or "--dryrun" in args
+
+
+def _package_cleanup(tool: str, args: tuple[str, ...]) -> bool:
+    """Conservative package cleanup recognition; unknown actions are not blocked."""
+    if tool == "brew":
+        return "cleanup" in args
+    if tool in {"npm", "pnpm"}:
+        return args[:2] == ("cache", "clean")
+    if tool == "yarn":
+        return args[:2] == ("cache", "clean")
+    if tool in {"pip", "pip3"}:
+        return args[:2] == ("cache", "purge")
+    return False
+
+
+def _package_scan_allowed(tool: str, args: tuple[str, ...]) -> bool:
+    if _explicit_dry_run(args):
+        return True
+    if tool == "brew":
+        return args[:1] in (("--version",), ("list",), ("info",))
+    if tool in {"npm", "pnpm"}:
+        return args[:2] in (("cache", "verify"), ("--version",), ("-v",))
+    if tool == "yarn":
+        return args[:2] in (("cache", "dir"), ("cache", "list"), ("--version",))
+    if tool in {"pip", "pip3"}:
+        return args[:2] in (("cache", "dir"), ("cache", "list"), ("--version",))
+    return False
