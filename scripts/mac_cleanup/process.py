@@ -133,13 +133,32 @@ def _unwrap(argv: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
         name = os.path.basename(argv[index])
         if name == "env":
             index += 1
-            while index < len(argv) and (argv[index].startswith("-") or "=" in argv[index]):
-                index += 1
+            while index < len(argv):
+                option = argv[index]
+                if "=" in option:
+                    index += 1
+                elif option in {"-u", "--unset", "-C", "--chdir"}:
+                    index += 2
+                elif option in {"-i", "--ignore-environment", "-0"}:
+                    index += 1
+                elif option.startswith("-"):
+                    return "", ()
+                else:
+                    break
             continue
         if name in {"sudo", "command", "exec"}:
             index += 1
-            while index < len(argv) and argv[index].startswith("-"):
-                index += 1
+            if name == "sudo":
+                while index < len(argv):
+                    option = argv[index]
+                    if option in {"-u", "--user", "-g", "--group", "-h", "--host", "-D", "--chdir"}:
+                        index += 2
+                    elif option in {"-n", "--non-interactive", "-E", "--preserve-env"}:
+                        index += 1
+                    elif option.startswith("-"):
+                        return "", ()
+                    else:
+                        break
             continue
         break
     if index >= len(argv):
@@ -149,6 +168,8 @@ def _unwrap(argv: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
 
 def _disallowed_reason(argv: tuple[str, ...], mode: OperationMode) -> str | None:
     executable, raw_args = _unwrap(argv)
+    if not executable:
+        return "unsupported command wrapper is disallowed during scans"
     args = tuple(item.lower() for item in raw_args)
     if mode is not OperationMode.SCAN:
         return None

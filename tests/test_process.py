@@ -1,5 +1,8 @@
 import sys
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.mac_cleanup.process import OperationMode, ProcessRunner, ToolResolver
 
@@ -42,6 +45,8 @@ class ProcessTest(unittest.TestCase):
             ("open", "/tmp/example"),
             ("adb", "-P", "5037", "devices"),
             ("env", "adb", "devices"),
+            ("env", "-u", "HOME", "adb", "devices"),
+            ("sudo", "-u", "root", "adb", "devices"),
             ("brew", "cleanup"),
             ("npm", "cache", "clean", "--force"),
             ("yarn", "cache", "clean"),
@@ -52,10 +57,22 @@ class ProcessTest(unittest.TestCase):
             self.assertIsNone(result.exit_code)
 
     def test_dry_run_package_cleanup_is_allowed_to_execute(self) -> None:
-        result = ProcessRunner().run(
-            ("brew", "cleanup", "--dry-run"), timeout_seconds=1
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "brew"
+            executable.write_text("#!/bin/sh\nprintf 'dry-run-ok\\n'\n")
+            executable.chmod(0o700)
+            original_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = directory
+            try:
+                result = ProcessRunner().run(
+                    ("brew", "cleanup", "--dry-run"), timeout_seconds=1
+                )
+            finally:
+                os.environ["PATH"] = original_path
         self.assertFalse(result.disallowed)
+        self.assertTrue(result.available)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout.strip(), "dry-run-ok")
 
     def test_approved_mutation_mode_can_execute_a_command(self) -> None:
         result = ProcessRunner().run(
