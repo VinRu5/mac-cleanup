@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import hashlib
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Mapping
+from typing import Mapping
 
 from .jsonio import atomic_write_json, canonical_bytes, read_json
 from .models import Issue, Manifest, TargetStatus
@@ -28,6 +29,10 @@ ALLOWED_TRANSITIONS = {
 
 class InvalidTransition(ValueError):
     """Raised when a target lifecycle transition is not explicitly allowed."""
+
+
+class SessionConsistencyError(ValueError):
+    """Raised when session artifacts cannot be reconciled safely."""
 
 
 class Session:
@@ -51,6 +56,7 @@ class Session:
             "created_at": _timestamp(),
             "events": [],
             "issues": [],
+            "manifest": None,
             "targets": {},
         }
         atomic_write_json(state_path, state)
@@ -62,7 +68,9 @@ class Session:
         directory = Path(path)
         state = read_json(directory / "state.json")
         _validate_state(state)
-        return cls(directory, state)
+        session = cls(directory, state)
+        session._reconcile_manifest()
+        return session
 
     @property
     def inventory_path(self) -> Path:
@@ -105,19 +113,27 @@ class Session:
         """Persist an immutable manifest and register its target lifecycle states."""
         value = manifest.to_dict() if isinstance(manifest, Manifest) else _object(manifest, "manifest")
         _require_schema(value, "manifest")
-        if self.manifest_path.exists() and canonical_bytes(read_json(self.manifest_path)) != canonical_bytes(value):
-            raise ValueError("manifest is immutable once written to a session")
-
         target_statuses = _target_statuses(value)
+        record = _manifest_record(value, target_statuses)
         current_targets = self._targets()
-        if current_targets and set(current_targets) != set(target_statuses):
-            raise ValueError("state targets do not match the session manifest")
-
-        atomic_write_json(self.manifest_path, value)
-        if not current_targets:
+        existing = _state_manifest_record(self._state)
+        if existing is None:
+            if current_targets:
+                raise SessionConsistencyError("state targets exist without a manifest record")
             next_state = copy.deepcopy(self._state)
+            next_state["manifest"] = record
             next_state["targets"] = target_statuses
             self._persist_state(next_state)
+        elif existing["digest"] != record["digest"]:
+            raise ValueError("manifest is immutable once written to a session")
+        elif set(current_targets) != set(target_statuses):
+            raise SessionConsistencyError("state targets do not match the session manifest")
+
+        if self.manifest_path.exists():
+            if _manifest_digest(read_json(self.manifest_path)) != record["digest"]:
+                raise SessionConsistencyError("manifest artifact differs from durable state")
+            return
+        atomic_write_json(self.manifest_path, value)
 
     def read_manifest(self) -> Manifest:
         return Manifest.from_dict(read_json(self.manifest_path))
@@ -174,6 +190,34 @@ class Session:
         atomic_write_json(self.state_path, state)
         self._state = state
 
+    def _reconcile_manifest(self) -> None:
+        """Repair a missing manifest artifact only from state, never by inference."""
+        record = _state_manifest_record(self._state)
+        current_targets = self._targets()
+        if record is None:
+            if not self.manifest_path.exists():
+                if current_targets:
+                    raise SessionConsistencyError("state targets exist without a manifest artifact")
+                return
+            artifact = read_json(self.manifest_path)
+            statuses = _target_statuses(artifact)
+            if current_targets and set(current_targets) != set(statuses):
+                raise SessionConsistencyError("legacy state targets do not match manifest artifact")
+            next_state = copy.deepcopy(self._state)
+            next_state["manifest"] = _manifest_record(artifact, statuses)
+            if not current_targets:
+                next_state["targets"] = statuses
+            self._persist_state(next_state)
+            return
+
+        if set(current_targets) != set(record["target_ids"]):
+            raise SessionConsistencyError("state target ids do not match manifest record")
+        if self.manifest_path.exists():
+            if _manifest_digest(read_json(self.manifest_path)) != record["digest"]:
+                raise SessionConsistencyError("manifest artifact differs from durable state")
+            return
+        atomic_write_json(self.manifest_path, record["value"])
+
 
 def _object(value: Mapping[str, object], label: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
@@ -207,6 +251,39 @@ def _target_statuses(manifest: Mapping[str, object]) -> dict[str, str]:
     return targets
 
 
+def _manifest_digest(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def _manifest_record(
+    value: Mapping[str, object], target_statuses: Mapping[str, str]
+) -> dict[str, object]:
+    return {
+        "digest": _manifest_digest(value),
+        "target_ids": sorted(target_statuses),
+        "value": dict(value),
+    }
+
+
+def _state_manifest_record(state: Mapping[str, object]) -> dict[str, object] | None:
+    record = state.get("manifest")
+    if record is None:
+        return None
+    if not isinstance(record, Mapping):
+        raise ValueError("state manifest must be an object or null")
+    digest = record.get("digest")
+    target_ids = record.get("target_ids")
+    value = record.get("value")
+    if not isinstance(digest, str) or not isinstance(target_ids, list) or not isinstance(value, Mapping):
+        raise ValueError("state manifest record is malformed")
+    if not all(isinstance(target_id, str) for target_id in target_ids):
+        raise ValueError("state manifest target ids must be text")
+    statuses = _target_statuses(value)
+    if target_ids != sorted(statuses) or digest != _manifest_digest(value):
+        raise ValueError("state manifest record does not match its payload")
+    return {"digest": digest, "target_ids": target_ids, "value": dict(value)}
+
+
 def _validate_state(state: Mapping[str, object]) -> None:
     _require_schema(state, "state")
     for key, expected in (("created_at", str), ("events", list), ("issues", list), ("targets", dict)):
@@ -218,6 +295,9 @@ def _validate_state(state: Mapping[str, object]) -> None:
         if not isinstance(target_id, str):
             raise ValueError("state target ids must be text")
         TargetStatus(status)
+    record = _state_manifest_record(state)
+    if record is not None and set(targets) != set(record["target_ids"]):
+        raise ValueError("state target ids do not match manifest record")
 
 
 def _timestamp() -> str:

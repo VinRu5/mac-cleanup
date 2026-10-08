@@ -1,8 +1,10 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.mac_cleanup.jsonio import read_json
+from scripts.mac_cleanup.jsonio import atomic_write_json, read_json
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Severity, Target
 from scripts.mac_cleanup.sessions import InvalidTransition, Session
 
@@ -44,6 +46,8 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(read_json(self.session_path / "manifest.json"), self.manifest.to_dict())
         self.assertEqual((self.session_path / "report.md").read_text(encoding="utf-8"), "# Cleanup report\n")
         self.assertEqual(session.state["issues"][0]["code"], "OPTIONAL_TOOL_MISSING")
+        for artifact in ("inventory.json", "policy.json", "manifest.json", "state.json"):
+            self.assertEqual(os.stat(self.session_path / artifact).st_mode & 0o777, 0o600)
 
     def test_valid_lifecycle_is_persisted_and_terminal_state_cannot_reopen(self) -> None:
         session = Session.create(self.session_path)
@@ -81,6 +85,25 @@ class SessionTest(unittest.TestCase):
         )
         with self.assertRaises(FileNotFoundError):
             Session.load(self.session_path / "missing")
+
+    def test_reload_recovers_manifest_artifact_after_state_first_interruption(self) -> None:
+        session = Session.create(self.session_path)
+
+        def interrupt_manifest_write(path: str | Path, value: object) -> None:
+            if Path(path).name == "manifest.json":
+                raise OSError("simulated interruption")
+            atomic_write_json(path, value)
+
+        with patch("scripts.mac_cleanup.sessions.atomic_write_json", side_effect=interrupt_manifest_write):
+            with self.assertRaises(OSError):
+                session.write_manifest(self.manifest)
+        del session
+
+        resumed = Session.load(self.session_path)
+
+        self.assertEqual(resumed.status("cache-a"), "pending")
+        self.assertEqual(read_json(self.session_path / "manifest.json"), self.manifest.to_dict())
+        self.assertEqual(resumed.state["manifest"]["target_ids"], ["cache-a"])
 
 
 if __name__ == "__main__":
