@@ -59,7 +59,7 @@ class PathsTest(unittest.TestCase):
         (sibling / "important.txt").write_text("keep", encoding="utf-8")
         identity = inspect_path(target, (self.allowed_root,))
 
-        removed_bytes = remove_tree_exact(identity)
+        removed_bytes = remove_tree_exact(identity, (self.allowed_root,))
 
         self.assertEqual(removed_bytes, identity.logical_bytes)
         self.assertFalse(target.exists())
@@ -72,8 +72,66 @@ class PathsTest(unittest.TestCase):
         target.write_bytes(b"new value")
 
         with self.assertRaises(PathSafetyError):
-            remove_tree_exact(identity)
+            remove_tree_exact(identity, (self.allowed_root,))
         self.assertTrue(target.exists())
+
+    def test_fingerprint_changes_after_equal_size_descendant_edit(self) -> None:
+        target = self.allowed_root / "cache"
+        target.mkdir()
+        child = target / "entry.bin"
+        child.write_bytes(b"same")
+        before = inspect_path(target, (self.allowed_root,))
+
+        child.write_bytes(b"size")
+        after = inspect_path(target, (self.allowed_root,))
+
+        self.assertNotEqual(before.fingerprint, after.fingerprint)
+
+    def test_remove_tree_rejects_a_replaced_target_symlink(self) -> None:
+        target = self.allowed_root / "cache"
+        target.mkdir()
+        (target / "entry.bin").write_bytes(b"cache")
+        identity = inspect_path(target, (self.allowed_root,))
+        outside = self.root / "outside"
+        outside.mkdir()
+        protected = outside / "important.txt"
+        protected.write_text("keep", encoding="utf-8")
+
+        (target / "entry.bin").unlink()
+        target.rmdir()
+        os.symlink(outside, target)
+
+        with self.assertRaises(PathSafetyError):
+            remove_tree_exact(identity, (self.allowed_root,))
+        self.assertEqual(protected.read_text(encoding="utf-8"), "keep")
+
+    def test_remove_tree_rejects_a_replaced_descendant_symlink(self) -> None:
+        target = self.allowed_root / "cache"
+        target.mkdir()
+        child = target / "entry.bin"
+        child.write_bytes(b"cache")
+        identity = inspect_path(target, (self.allowed_root,))
+        outside = self.root / "outside"
+        outside.mkdir()
+        protected = outside / "important.txt"
+        protected.write_text("keep", encoding="utf-8")
+
+        child.unlink()
+        os.symlink(outside, child)
+
+        with self.assertRaises(PathSafetyError):
+            remove_tree_exact(identity, (self.allowed_root,))
+        self.assertEqual(protected.read_text(encoding="utf-8"), "keep")
+
+    def test_remove_tree_rejects_identity_outside_supplied_allowed_roots(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "cache.bin").write_bytes(b"cache")
+        forged_identity = inspect_path(outside, (self.root,))
+
+        with self.assertRaises(PathSafetyError):
+            remove_tree_exact(forged_identity, (self.allowed_root,))
+        self.assertTrue(outside.exists())
 
     def test_rejects_symlinks_found_inside_a_directory(self) -> None:
         target = self.allowed_root / "cache"
