@@ -105,6 +105,16 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(read_json(self.session_path / "manifest.json"), self.manifest.to_dict())
         self.assertEqual(resumed.state["manifest"]["target_ids"], ["cache-a"])
 
+    def test_manifest_record_is_isolated_from_caller_mutation(self) -> None:
+        session = Session.create(self.session_path)
+        manifest = self.manifest.to_dict()
+        session.write_manifest(manifest)
+
+        manifest["batches"][0]["targets"][0]["id"] = "poisoned-id"  # type: ignore[index]
+
+        session.transition("cache-a", "approved")
+        self.assertEqual(session.status("cache-a"), "approved")
+
 
 if __name__ == "__main__":
     unittest.main()

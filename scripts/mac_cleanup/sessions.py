@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -113,6 +114,7 @@ class Session:
         """Persist an immutable manifest and register its target lifecycle states."""
         value = manifest.to_dict() if isinstance(manifest, Manifest) else _object(manifest, "manifest")
         _require_schema(value, "manifest")
+        value = _canonical_object(value)
         target_statuses = _target_statuses(value)
         record = _manifest_record(value, target_statuses)
         current_targets = self._targets()
@@ -133,7 +135,7 @@ class Session:
             if _manifest_digest(read_json(self.manifest_path)) != record["digest"]:
                 raise SessionConsistencyError("manifest artifact differs from durable state")
             return
-        atomic_write_json(self.manifest_path, value)
+        atomic_write_json(self.manifest_path, record["value"])
 
     def read_manifest(self) -> Manifest:
         return Manifest.from_dict(read_json(self.manifest_path))
@@ -258,10 +260,11 @@ def _manifest_digest(value: Mapping[str, object]) -> str:
 def _manifest_record(
     value: Mapping[str, object], target_statuses: Mapping[str, str]
 ) -> dict[str, object]:
+    canonical_value = _canonical_object(value)
     return {
-        "digest": _manifest_digest(value),
+        "digest": _manifest_digest(canonical_value),
         "target_ids": sorted(target_statuses),
-        "value": dict(value),
+        "value": canonical_value,
     }
 
 
@@ -281,7 +284,13 @@ def _state_manifest_record(state: Mapping[str, object]) -> dict[str, object] | N
     statuses = _target_statuses(value)
     if target_ids != sorted(statuses) or digest != _manifest_digest(value):
         raise ValueError("state manifest record does not match its payload")
-    return {"digest": digest, "target_ids": target_ids, "value": dict(value)}
+    return {"digest": digest, "target_ids": target_ids, "value": _canonical_object(value)}
+
+
+def _canonical_object(value: Mapping[str, object]) -> dict[str, object]:
+    copied = json.loads(canonical_bytes(value).decode("utf-8"))
+    assert isinstance(copied, dict)
+    return copied
 
 
 def _validate_state(state: Mapping[str, object]) -> None:
