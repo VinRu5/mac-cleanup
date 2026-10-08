@@ -1,0 +1,56 @@
+import sys
+import unittest
+
+from scripts.mac_cleanup.process import ProcessRunner, ToolResolver
+
+
+class ProcessTest(unittest.TestCase):
+    def test_argv_python_command_succeeds_without_a_shell(self) -> None:
+        result = ProcessRunner().run(
+            (sys.executable, "-c", "print('ok')"), timeout_seconds=5
+        )
+        self.assertTrue(result.available)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout.strip(), "ok")
+        self.assertFalse(result.timed_out)
+        self.assertFalse(result.mutation)
+        self.assertEqual(result.argv[0], sys.executable)
+
+    def test_sleeping_command_is_reported_as_timed_out(self) -> None:
+        result = ProcessRunner().run(
+            (sys.executable, "-c", "import time; time.sleep(1)"), timeout_seconds=0.01
+        )
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.exit_code)
+        self.assertGreaterEqual(result.duration_seconds, 0)
+
+    def test_missing_executable_is_unavailable(self) -> None:
+        result = ProcessRunner().run(("definitely-not-a-real-tool",), timeout_seconds=1)
+        self.assertFalse(result.available)
+        self.assertIsNone(result.exit_code)
+        self.assertIn("unavailable", result.stderr)
+
+    def test_string_commands_are_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            ProcessRunner().run("echo unsafe", timeout_seconds=1)  # type: ignore[arg-type]
+
+    def test_resolver_uses_path_lookup(self) -> None:
+        self.assertIsNotNone(ToolResolver().resolve(sys.executable))
+
+    def test_scan_disallows_known_side_effecting_commands(self) -> None:
+        for argv in (("open", "/tmp/example"), ("adb", "devices"), ("brew", "cleanup")):
+            result = ProcessRunner().run(argv, timeout_seconds=1, mutation=True)
+            self.assertTrue(result.disallowed, argv)
+            self.assertIsNone(result.exit_code)
+
+    def test_dry_run_package_cleanup_is_allowed_to_execute(self) -> None:
+        result = ProcessRunner().run(
+            (sys.executable, "-c", "print('dry')", "--dry-run"),
+            timeout_seconds=1,
+            mutation=False,
+        )
+        self.assertFalse(result.disallowed)
+
+
+if __name__ == "__main__":
+    unittest.main()
