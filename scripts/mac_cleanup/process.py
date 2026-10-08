@@ -159,6 +159,19 @@ def _unwrap(argv: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
                         return "", ()
                     else:
                         break
+            else:
+                while index < len(argv):
+                    option = argv[index]
+                    if name == "command" and option == "-p":
+                        index += 1
+                    elif name == "exec" and option in {"-a", "--argv0"}:
+                        index += 2
+                    elif name == "exec" and option in {"-c", "-l"}:
+                        index += 1
+                    elif option.startswith("-"):
+                        return "", ()
+                    else:
+                        break
             continue
         break
     if index >= len(argv):

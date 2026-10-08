@@ -47,6 +47,8 @@ class ProcessTest(unittest.TestCase):
             ("env", "adb", "devices"),
             ("env", "-u", "HOME", "adb", "devices"),
             ("sudo", "-u", "root", "adb", "devices"),
+            ("command", "-p", "adb", "devices"),
+            ("exec", "-a", "adb", "adb", "devices"),
             ("brew", "cleanup"),
             ("npm", "cache", "clean", "--force"),
             ("yarn", "cache", "clean"),
