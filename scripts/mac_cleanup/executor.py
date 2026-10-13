@@ -27,6 +27,8 @@ class BatchOutcome:
     free_space_after: int | None = None
     dry_run: bool = False
     suspended: bool = False
+    regenerated_bytes: int = 0
+    regenerated_target_ids: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def free_space_delta(self) -> int | None:
@@ -63,23 +65,49 @@ def apply_batch(
     """Preflight an entire approved batch, then remove each exact identity."""
     roots = tuple(allowed_roots)
     persisted = _approved_session_batch(session, batch)
-    preflights = tuple(_preflight_target(target, roots) for target in persisted.targets)
+    latched = session.critical_issue()
+    if latched is not None:
+        return BatchOutcome(
+            batch_id=persisted.id,
+            issues=(latched,),
+            dry_run=dry_run,
+            suspended=True,
+        )
+    preflights = _batch_preflights(session, persisted, roots)
     issues = tuple(issue for result in preflights for issue in result.issues)
+    regenerated_bytes, regenerated_ids = _regenerated(preflights)
     issues += _state_precondition_issues(session, preflights, applying=True)
     has_critical = _has_severity(issues, Severity.CRITICAL)
     has_batch_error = _has_severity(issues, Severity.BATCH_ERROR)
 
-    if dry_run or has_critical:
+    if dry_run:
         return BatchOutcome(
-            persisted.id,
-            issues,
+            batch_id=persisted.id,
+            issues=issues,
             dry_run=dry_run,
             suspended=has_batch_error,
+            regenerated_bytes=regenerated_bytes,
+            regenerated_target_ids=regenerated_ids,
+        )
+    if has_critical:
+        _latch_first_critical(session, issues)
+        return BatchOutcome(
+            batch_id=persisted.id,
+            issues=issues,
+            suspended=True,
+            regenerated_bytes=regenerated_bytes,
+            regenerated_target_ids=regenerated_ids,
         )
     if has_batch_error:
         _record_new_issues(session, issues)
         _suspend_mutable_targets(session, persisted)
-        return BatchOutcome(persisted.id, issues, suspended=True)
+        return BatchOutcome(
+            batch_id=persisted.id,
+            issues=issues,
+            suspended=True,
+            regenerated_bytes=regenerated_bytes,
+            regenerated_target_ids=regenerated_ids,
+        )
 
     before = _free_space(roots, persisted)
     removed = 0
@@ -123,18 +151,30 @@ def apply_batch(
     after = _free_space(roots, persisted)
     if runtime_issues:
         runtime = tuple(runtime_issues)
-        if not _has_severity(runtime, Severity.CRITICAL):
+        if _has_severity(runtime, Severity.CRITICAL):
+            _latch_first_critical(session, runtime)
+        else:
             _record_new_issues(session, runtime)
             _suspend_mutable_targets(session, persisted)
         return BatchOutcome(
-            persisted.id,
-            issues + runtime,
-            removed,
-            before,
-            after,
+            batch_id=persisted.id,
+            issues=issues + runtime,
+            logical_bytes_removed=removed,
+            free_space_before=before,
+            free_space_after=after,
             suspended=True,
+            regenerated_bytes=regenerated_bytes,
+            regenerated_target_ids=regenerated_ids,
         )
-    return BatchOutcome(persisted.id, issues, removed, before, after)
+    return BatchOutcome(
+        batch_id=persisted.id,
+        issues=issues,
+        logical_bytes_removed=removed,
+        free_space_before=before,
+        free_space_after=after,
+        regenerated_bytes=regenerated_bytes,
+        regenerated_target_ids=regenerated_ids,
+    )
 
 
 def verify_batch(
@@ -145,17 +185,36 @@ def verify_batch(
     """Explicitly verify absence; never remove a target."""
     roots = tuple(allowed_roots)
     persisted = _approved_session_batch(session, batch)
-    preflights = tuple(_preflight_target(target, roots) for target in persisted.targets)
+    latched = session.critical_issue()
+    if latched is not None:
+        return BatchOutcome(
+            batch_id=persisted.id, issues=(latched,), suspended=True
+        )
+    preflights = _batch_preflights(session, persisted, roots)
     issues = tuple(issue for result in preflights for issue in result.issues)
+    regenerated_bytes, regenerated_ids = _regenerated(preflights)
     issues += _state_precondition_issues(session, preflights, applying=False)
     has_critical = _has_severity(issues, Severity.CRITICAL)
     has_batch_error = _has_severity(issues, Severity.BATCH_ERROR)
     if has_critical:
-        return BatchOutcome(persisted.id, issues, suspended=has_batch_error)
+        _latch_first_critical(session, issues)
+        return BatchOutcome(
+            batch_id=persisted.id,
+            issues=issues,
+            suspended=True,
+            regenerated_bytes=regenerated_bytes,
+            regenerated_target_ids=regenerated_ids,
+        )
     if has_batch_error:
         _record_new_issues(session, issues)
         _suspend_mutable_targets(session, persisted)
-        return BatchOutcome(persisted.id, issues, suspended=True)
+        return BatchOutcome(
+            batch_id=persisted.id,
+            issues=issues,
+            suspended=True,
+            regenerated_bytes=regenerated_bytes,
+            regenerated_target_ids=regenerated_ids,
+        )
 
     for result in preflights:
         status = session.status(result.target.id)
@@ -165,7 +224,53 @@ def verify_batch(
         if status == "approved":
             session.transition(result.target.id, "applied")
         session.transition(result.target.id, "verified")
-    return BatchOutcome(persisted.id, issues)
+    return BatchOutcome(
+        batch_id=persisted.id,
+        issues=issues,
+        regenerated_bytes=regenerated_bytes,
+        regenerated_target_ids=regenerated_ids,
+    )
+
+
+def _batch_preflights(
+    session: Session,
+    batch: Batch,
+    roots: tuple[str | os.PathLike[str], ...],
+) -> tuple[_Preflight, ...]:
+    return tuple(
+        _verified_recreation(session, _preflight_target(target, roots))
+        for target in batch.targets
+    )
+
+
+def _verified_recreation(session: Session, result: _Preflight) -> _Preflight:
+    if session.status(result.target.id) != "verified" or result.identity is None:
+        return result
+    if _has_severity(result.issues, Severity.CRITICAL):
+        return result
+    issue = Issue(
+        "executor.target-regenerated",
+        Severity.INFORMATIONAL,
+        f"Verified target was regenerated: {result.target.path}",
+        result.target.id,
+    )
+    return _Preflight(result.target, result.identity, (issue,))
+
+
+def _regenerated(preflights: tuple[_Preflight, ...]) -> tuple[int, tuple[str, ...]]:
+    regenerated = tuple(
+        result
+        for result in preflights
+        if any(issue.code == "executor.target-regenerated" for issue in result.issues)
+    )
+    return (
+        sum(
+            result.identity.logical_bytes
+            for result in regenerated
+            if result.identity is not None
+        ),
+        tuple(result.target.id for result in regenerated),
+    )
 
 
 def _preflight_target(
@@ -191,6 +296,7 @@ def _preflight_target(
     if identity.fingerprint != target.fingerprint:
         return _Preflight(
             target,
+            identity,
             issues=(
                 Issue(
                     "executor.fingerprint-changed",
@@ -203,6 +309,7 @@ def _preflight_target(
     if _target_in_use(identity):
         return _Preflight(
             target,
+            identity,
             issues=(
                 Issue(
                     "executor.target-in-use",
@@ -265,6 +372,12 @@ def _location_issue(
             return _critical_location_issue(target)
         if not any(_strictly_below(candidate, root) for root in canonical_roots):
             return _critical_location_issue(target)
+        if target.id.startswith("user-caches:"):
+            expected_name = target.id.removeprefix("user-caches:")
+            if candidate.name != expected_name or not any(
+                candidate.parent == root for root in canonical_roots
+            ):
+                return _critical_location_issue(target)
         current = Path(candidate.anchor)
         for part in candidate.parts[1:]:
             current /= part
@@ -423,6 +536,11 @@ def _in_use_issue(target: Target, error: BaseException) -> Issue:
 
 def _has_severity(issues: tuple[Issue, ...], severity: Severity) -> bool:
     return any(issue.severity is severity for issue in issues)
+
+
+def _latch_first_critical(session: Session, issues: tuple[Issue, ...]) -> None:
+    critical = next(issue for issue in issues if issue.severity is Severity.CRITICAL)
+    session.latch_critical(critical)
 
 
 def _suspend_mutable_targets(session: Session, batch: Batch) -> None:

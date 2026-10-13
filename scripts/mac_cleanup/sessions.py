@@ -12,7 +12,7 @@ import tempfile
 from typing import Mapping, Sequence
 
 from .jsonio import atomic_write_json, canonical_bytes, read_json
-from .models import Issue, Manifest, TargetStatus
+from .models import Issue, Manifest, Severity, TargetStatus
 
 
 SCHEMA_VERSION = 1
@@ -55,6 +55,7 @@ class Session:
         state: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "created_at": _timestamp(),
+            "critical_stop": None,
             "events": [],
             "issues": [],
             "manifest": None,
@@ -156,6 +157,30 @@ class Session:
         issues = next_state["issues"]
         assert isinstance(issues, list)
         issues.append({"at": _timestamp(), **value})
+        self._persist_state(next_state)
+
+    def critical_issue(self) -> Issue | None:
+        """Return the durable global-stop cause, if one has been latched."""
+        value = self._state.get("critical_stop")
+        if value is None:
+            return None
+        assert isinstance(value, Mapping)
+        return Issue.from_dict(value)
+
+    def latch_critical(self, issue: Issue) -> None:
+        """Atomically persist the first critical issue as a global stop."""
+        if not isinstance(issue, Issue):
+            raise TypeError("critical stop must be an Issue")
+        if issue.severity is not Severity.CRITICAL:
+            raise ValueError("critical stop issue must have critical severity")
+        if self.critical_issue() is not None:
+            return
+        record = {"at": _timestamp(), **issue.to_dict()}
+        next_state = copy.deepcopy(self._state)
+        next_state["critical_stop"] = record
+        issues = next_state["issues"]
+        assert isinstance(issues, list)
+        issues.append(record.copy())
         self._persist_state(next_state)
 
     def status(self, target_id: str) -> str:
@@ -350,6 +375,13 @@ def _validate_state(state: Mapping[str, object]) -> None:
     record = _state_manifest_record(state)
     if record is not None and set(targets) != set(record["target_ids"]):
         raise ValueError("state target ids do not match manifest record")
+    critical_stop = state.get("critical_stop")
+    if critical_stop is not None:
+        if not isinstance(critical_stop, Mapping):
+            raise ValueError("state critical_stop must be an object or null")
+        critical_issue = Issue.from_dict(critical_stop)
+        if critical_issue.severity is not Severity.CRITICAL:
+            raise ValueError("state critical_stop must contain a critical issue")
 
 
 def _timestamp() -> str:

@@ -102,16 +102,73 @@ class ExecutorTest(unittest.TestCase):
         (replaced_path / "entry.bin").unlink()
         replaced_path.rmdir()
         os.symlink(protected, replaced_path)
-        state_before = self.session.state
-
         outcome = apply_batch(self.session, batch, (self.allowed_root,))
 
         self.assertTrue(Path(valid.path).exists())
         self.assertEqual(
             (protected / "important.txt").read_text(encoding="utf-8"), "keep"
         )
-        self.assertEqual(self.session.state, state_before)
         self.assertIn(Severity.CRITICAL, {issue.severity for issue in outcome.issues})
+        resumed = Session.load(self.session.path)
+        self.assertEqual(
+            resumed.critical_issue().code, "executor.symlink-or-outside"
+        )
+        self.assertEqual(resumed.state["issues"][-1]["severity"], "critical")
+
+    def test_critical_latch_blocks_a_future_independent_batch(self) -> None:
+        replaced = self._target("cache-a")
+        independent = self._target("cache-b")
+        first = Batch("safe-a", (replaced,))
+        second = Batch("safe-b", (independent,))
+        self._write_and_approve(first, second)
+        replaced_path = Path(replaced.path)
+        (replaced_path / "entry.bin").unlink()
+        replaced_path.rmdir()
+        os.symlink(self.root, replaced_path)
+
+        apply_batch(self.session, first, (self.allowed_root,))
+        resumed = Session.load(self.session.path)
+        outcome = apply_batch(resumed, second, (self.allowed_root,))
+
+        self.assertIn(Severity.CRITICAL, {issue.severity for issue in outcome.issues})
+        self.assertTrue(Path(independent.path).exists())
+        self.assertEqual(resumed.status(independent.id), "approved")
+
+    def test_critical_dry_run_reports_without_latching_or_transitioning(self) -> None:
+        replaced = self._target("cache-a")
+        batch = Batch("safe-a", (replaced,))
+        self._write_and_approve(batch)
+        replaced_path = Path(replaced.path)
+        (replaced_path / "entry.bin").unlink()
+        replaced_path.rmdir()
+        os.symlink(self.root, replaced_path)
+        state_before = self.session.state
+
+        outcome = apply_batch(
+            self.session, batch, (self.allowed_root,), dry_run=True
+        )
+
+        self.assertIn(Severity.CRITICAL, {issue.severity for issue in outcome.issues})
+        self.assertEqual(self.session.state, state_before)
+        self.assertIsNone(self.session.critical_issue())
+
+    def test_runtime_critical_is_latched_before_returning(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+
+        with patch(
+            "scripts.mac_cleanup.executor.remove_tree_exact",
+            side_effect=PathSafetyError("symlinks are not allowed"),
+        ):
+            outcome = apply_batch(self.session, batch, (self.allowed_root,))
+
+        self.assertIn(Severity.CRITICAL, {issue.severity for issue in outcome.issues})
+        self.assertEqual(
+            Session.load(self.session.path).critical_issue().code,
+            "executor.symlink-or-outside",
+        )
+        self.assertTrue(Path(target.path).exists())
 
     def test_batch_error_does_not_change_an_independent_batch(self) -> None:
         changed = self._target("cache-a", b"old")
@@ -143,6 +200,28 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(first.logical_bytes_removed, target.logical_bytes)
         self.assertEqual(second.logical_bytes_removed, 0)
         self.assertEqual(self.session.status(target.id), "verified")
+
+    def test_recreated_verified_target_is_informational_and_never_reapplied(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        apply_batch(self.session, batch, (self.allowed_root,))
+        recreated = Path(target.path)
+        recreated.mkdir()
+        content = b"regenerated-cache"
+        (recreated / "entry.bin").write_bytes(content)
+
+        verified = verify_batch(self.session, batch, (self.allowed_root,))
+        applied_again = apply_batch(self.session, batch, (self.allowed_root,))
+
+        self.assertEqual(self.session.status(target.id), "verified")
+        self.assertTrue(recreated.exists())
+        self.assertEqual(verified.regenerated_target_ids, (target.id,))
+        self.assertEqual(verified.regenerated_bytes, len(content))
+        self.assertEqual(verified.issues[0].code, "executor.target-regenerated")
+        self.assertEqual(verified.issues[0].severity, Severity.INFORMATIONAL)
+        self.assertEqual(applied_again.regenerated_target_ids, (target.id,))
+        self.assertEqual(applied_again.regenerated_bytes, len(content))
 
     def test_all_targets_are_preflighted_before_first_removal(self) -> None:
         first = self._target("cache-a")

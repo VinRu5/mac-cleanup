@@ -4,7 +4,7 @@ from pathlib import Path
 
 from scripts.mac_cleanup.cli import build_parser, main
 from scripts.mac_cleanup.manifests import approval_digest, build_manifest
-from scripts.mac_cleanup.models import Risk, Target
+from scripts.mac_cleanup.models import Batch, Manifest, Risk, Target
 from scripts.mac_cleanup.modules.base import ScanResult
 from scripts.mac_cleanup.paths import inspect_path
 from scripts.mac_cleanup.sessions import Session
@@ -84,8 +84,9 @@ class CliTest(unittest.TestCase):
     def test_apply_dry_run_and_apply_operate_only_on_the_named_batch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            cache_root = root / "Caches"
-            cache_root.mkdir()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            cache_root.mkdir(parents=True)
             targets = []
             for name in ("first", "second"):
                 path = cache_root / name
@@ -124,14 +125,57 @@ class CliTest(unittest.TestCase):
             self.assertEqual(main([
                 "apply", "--session", str(session.path),
                 "--batch", "safe-user-caches", "--dry-run",
-            ]), 0)
+            ], trusted_home=home), 0)
             self.assertEqual(Session.load(session.path).state, state_before)
             self.assertTrue(all(Path(target.path).exists() for target in targets))
 
             self.assertEqual(main([
                 "apply", "--session", str(session.path),
                 "--batch", "safe-user-caches",
-            ]), 0)
+            ], trusted_home=home), 0)
             resumed = Session.load(session.path)
             self.assertTrue(all(resumed.status(target.id) == "verified" for target in targets))
             self.assertTrue(all(not Path(target.path).exists() for target in targets))
+
+    def test_cli_rejects_fingerprinted_user_cache_outside_trusted_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            (home / "Library" / "Caches").mkdir(parents=True)
+            outside_root = root / "outside"
+            outside_root.mkdir()
+            outside = outside_root / "forged-cache"
+            outside.mkdir()
+            (outside / "important.bin").write_bytes(b"keep")
+            identity = inspect_path(outside, (outside_root,))
+            forged = Target(
+                id="user-caches:forged-cache",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            manifest = Manifest(
+                batches=(Batch("safe-user-caches", (forged,)),),
+                inventory_digest="a" * 64,
+            )
+            session = Session.create(root / "session")
+            session.write_manifest(manifest)
+            digest = approval_digest(manifest, "safe-user-caches")
+            self.assertEqual(main([
+                "approve", "--session", str(session.path),
+                "--batch", "safe-user-caches", "--digest", digest,
+            ]), 0)
+
+            result = main([
+                "apply", "--session", str(session.path),
+                "--batch", "safe-user-caches",
+            ], trusted_home=home)
+
+            self.assertEqual(result, 2)
+            self.assertTrue(outside.exists())
+            resumed = Session.load(session.path)
+            self.assertEqual(
+                resumed.critical_issue().code, "executor.symlink-or-outside"
+            )

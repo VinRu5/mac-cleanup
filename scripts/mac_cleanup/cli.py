@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+import os
 from pathlib import Path
+import pwd
 
 from .executor import apply_batch, verify_batch
 from .manifests import approve_batch
@@ -30,7 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None, *, trusted_home: Path | None = None
+) -> int:
     """Parse command-line arguments and return a process status code."""
     args = build_parser().parse_args(argv)
     if args.command == "approve":
@@ -42,7 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             session = Session.load(args.session)
             batch = _named_batch(session, args.batch)
-            roots = tuple(sorted({str(Path(target.path).parent) for target in batch.targets}))
+            roots = _trusted_allowed_roots(batch, trusted_home or _current_home())
             if args.command == "apply":
                 outcome = apply_batch(session, batch, roots, dry_run=args.dry_run)
             else:
@@ -64,3 +68,18 @@ def _named_batch(session: Session, batch_id: str) -> Batch:
     if len(matches) != 1:
         raise ValueError(f"unknown manifest batch: {batch_id}")
     return matches[0]
+
+
+def _current_home() -> Path:
+    """Return the account database home, independent of caller environment."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _trusted_allowed_roots(batch: Batch, home: Path) -> tuple[Path, ...]:
+    """Map fixed module identities to roots trusted independently of targets."""
+    modules = {target.id.partition(":")[0] for target in batch.targets}
+    if modules != {"user-caches"}:
+        raise ValueError("batch does not map to a supported trusted module root")
+    if not home.is_absolute():
+        raise ValueError("trusted home must be absolute")
+    return (home / "Library" / "Caches",)
