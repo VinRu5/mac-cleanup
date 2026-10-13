@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .jsonio import atomic_write_json, canonical_bytes, read_json
 from .models import Issue, Manifest, TargetStatus
@@ -132,12 +132,18 @@ class Session:
             raise SessionConsistencyError("state targets do not match the session manifest")
 
         if self.manifest_path.exists():
-            if _manifest_digest(read_json(self.manifest_path)) != record["digest"]:
-                raise SessionConsistencyError("manifest artifact differs from durable state")
+            self._validate_manifest_artifact_bytes(record)
             return
         atomic_write_json(self.manifest_path, record["value"])
 
     def read_manifest(self) -> Manifest:
+        """Read only the exact raw manifest bytes recorded in durable state."""
+        record = _state_manifest_record(self._state)
+        if record is not None:
+            self._validate_manifest_artifact_bytes(record)
+            value = record["value"]
+            assert isinstance(value, Mapping)
+            return Manifest.from_dict(value)
         return Manifest.from_dict(read_json(self.manifest_path))
 
     def write_report(self, report: str) -> None:
@@ -161,25 +167,43 @@ class Session:
 
     def transition(self, target_id: str, destination: str | TargetStatus) -> None:
         """Atomically record one explicit target-state change."""
+        self.transition_batch((target_id,), destination)
+
+    def transition_batch(
+        self, target_ids: Sequence[str], destination: str | TargetStatus
+    ) -> None:
+        """Atomically transition every supplied target after validating all of them."""
+        identifiers = tuple(target_ids)
+        if not identifiers:
+            raise ValueError("batch transition requires at least one target")
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("batch transition target ids must be unique")
         next_status = TargetStatus(destination).value
-        current_status = self.status(target_id)
-        if next_status not in ALLOWED_TRANSITIONS[current_status]:
-            raise InvalidTransition(f"cannot transition {target_id}: {current_status} -> {next_status}")
+        current_statuses: list[tuple[str, str]] = []
+        for target_id in identifiers:
+            current_status = self.status(target_id)
+            if next_status not in ALLOWED_TRANSITIONS[current_status]:
+                raise InvalidTransition(
+                    f"cannot transition {target_id}: {current_status} -> {next_status}"
+                )
+            current_statuses.append((target_id, current_status))
 
         next_state = copy.deepcopy(self._state)
         targets = next_state["targets"]
         events = next_state["events"]
         assert isinstance(targets, dict)
         assert isinstance(events, list)
-        targets[target_id] = next_status
-        events.append(
-            {
-                "at": _timestamp(),
-                "from": current_status,
-                "target_id": target_id,
-                "to": next_status,
-            }
-        )
+        timestamp = _timestamp()
+        for target_id, current_status in current_statuses:
+            targets[target_id] = next_status
+            events.append(
+                {
+                    "at": timestamp,
+                    "from": current_status,
+                    "target_id": target_id,
+                    "to": next_status,
+                }
+            )
         self._persist_state(next_state)
 
     def _targets(self) -> dict[str, str]:
@@ -215,10 +239,20 @@ class Session:
         if set(current_targets) != set(record["target_ids"]):
             raise SessionConsistencyError("state target ids do not match manifest record")
         if self.manifest_path.exists():
-            if _manifest_digest(read_json(self.manifest_path)) != record["digest"]:
-                raise SessionConsistencyError("manifest artifact differs from durable state")
+            self._validate_manifest_artifact_bytes(record)
             return
         atomic_write_json(self.manifest_path, record["value"])
+
+    def _validate_manifest_artifact_bytes(self, record: Mapping[str, object]) -> None:
+        """Reject every artifact variation before JSON parsing can normalize it."""
+        digest = record.get("digest")
+        value = record.get("value")
+        if not isinstance(digest, str) or not isinstance(value, Mapping):
+            raise SessionConsistencyError("state manifest record is malformed")
+        expected = canonical_bytes(value)
+        actual = self.manifest_path.read_bytes()
+        if hashlib.sha256(actual).hexdigest() != digest or actual != expected:
+            raise SessionConsistencyError("manifest artifact differs from durable state")
 
 
 def _object(value: Mapping[str, object], label: str) -> dict[str, object]:

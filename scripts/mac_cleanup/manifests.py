@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from collections.abc import Mapping
 
 from .jsonio import canonical_bytes
-from .models import Batch, Manifest, Risk, Target
+from .models import Batch, Manifest, Risk, Target, TargetStatus
 from .modules.base import ScanResult
 from .sessions import Session
 
@@ -83,18 +84,12 @@ def approve_batch(session: Session, batch_id: str, digest: str) -> None:
     if not isinstance(digest, str) or not digest:
         raise ValueError("approval digest must be non-empty text")
     manifest = session.read_manifest()
-    # Recheck the on-disk artifact against the durable session record before
-    # accepting a digest derived from it.
-    session.write_manifest(manifest)
+    _validate_approvable_manifest(manifest)
     batch = _batch(manifest, batch_id)
     expected = approval_digest(manifest, batch_id)
     if not hmac.compare_digest(digest, expected):
         raise ValueError("approval digest does not match the requested batch")
-    for target in batch.targets:
-        if session.status(target.id) != "pending":
-            raise ValueError(f"target is not pending: {target.id}")
-    for target in batch.targets:
-        session.transition(target.id, "approved")
+    session.transition_batch(tuple(target.id for target in batch.targets), "approved")
 
 
 def _validate_policy(policy: Mapping[str, object]) -> dict[str, object]:
@@ -158,6 +153,39 @@ def _batch(manifest: Manifest, batch_id: str) -> Batch:
         if batch.id == batch_id:
             return batch
     raise ValueError(f"unknown manifest batch: {batch_id}")
+
+
+def _validate_approvable_manifest(manifest: Manifest) -> None:
+    if manifest.schema_version != POLICY_SCHEMA_VERSION:
+        raise ValueError("manifest schema_version must be 1")
+    if not isinstance(manifest.inventory_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", manifest.inventory_digest
+    ):
+        raise ValueError("manifest inventory digest must be a SHA-256 hex digest")
+
+    expected_risks = {
+        _SAFE_USER_CACHES_BATCH: Risk.SAFE_REGENERABLE,
+        _REVIEW_USER_CACHES_BATCH: Risk.REVIEW_REQUIRED,
+    }
+    seen_batch_ids: set[str] = set()
+    for batch in manifest.batches:
+        if batch.id in seen_batch_ids or batch.id not in expected_risks:
+            raise ValueError(f"manifest contains an invalid batch: {batch.id}")
+        if not batch.targets:
+            raise ValueError(f"manifest batch is empty: {batch.id}")
+        seen_batch_ids.add(batch.id)
+        expected_risk = expected_risks[batch.id]
+        for target in batch.targets:
+            if not target.id.startswith(f"{_USER_CACHES_MODULE}:"):
+                raise ValueError(f"manifest target is outside the enabled module: {target.id}")
+            if not target.fingerprint:
+                raise ValueError(f"manifest target lacks a deep fingerprint: {target.id}")
+            if target.risk is Risk.NEVER_AUTOMATIC:
+                raise ValueError(f"manifest target is never automatic: {target.id}")
+            if target.risk is not expected_risk:
+                raise ValueError(f"manifest batch risk mismatch: {batch.id}: {target.id}")
+            if target.status is not TargetStatus.PENDING:
+                raise ValueError(f"manifest target is not pending: {target.id}")
 
 
 def _issue_key(issue: object) -> tuple[str, str, str, str]:

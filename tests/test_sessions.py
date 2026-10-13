@@ -115,6 +115,32 @@ class SessionTest(unittest.TestCase):
         session.transition("cache-a", "approved")
         self.assertEqual(session.status("cache-a"), "approved")
 
+    def test_batch_transition_is_all_or_none_when_state_persistence_is_interrupted(self) -> None:
+        second = Target(
+            id="cache-b",
+            path="/private/tmp/cache-b",
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="fingerprint-b",
+        )
+        session = Session.create(self.session_path)
+        session.write_manifest(Manifest(batches=(Batch("safe-caches", (self.target, second)),)))
+
+        def interrupt_state_write(path: str | Path, value: object) -> None:
+            if Path(path).name == "state.json":
+                raise OSError("simulated interruption")
+            atomic_write_json(path, value)
+
+        with patch("scripts.mac_cleanup.sessions.atomic_write_json", side_effect=interrupt_state_write):
+            with self.assertRaises(OSError):
+                session.transition_batch(("cache-a", "cache-b"), "approved")
+
+        self.assertEqual(session.status("cache-a"), "pending")
+        self.assertEqual(session.status("cache-b"), "pending")
+        self.assertEqual(session.state["events"], [])
+        reloaded = Session.load(self.session_path)
+        self.assertEqual(reloaded.state["targets"], {"cache-a": "pending", "cache-b": "pending"})
+
 
 if __name__ == "__main__":
     unittest.main()
