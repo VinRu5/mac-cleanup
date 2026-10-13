@@ -113,8 +113,7 @@ class Session:
     def write_manifest(self, manifest: Manifest | Mapping[str, object]) -> None:
         """Persist an immutable manifest and register its target lifecycle states."""
         value = manifest.to_dict() if isinstance(manifest, Manifest) else _object(manifest, "manifest")
-        _require_schema(value, "manifest")
-        value = _canonical_object(value)
+        value = _strict_manifest_value(value)
         target_statuses = _target_statuses(value)
         record = _manifest_record(value, target_statuses)
         current_targets = self._targets()
@@ -264,6 +263,16 @@ def _object(value: Mapping[str, object], label: str) -> dict[str, object]:
 def _require_schema(value: Mapping[str, object], label: str) -> None:
     if value.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"{label} schema_version must be {SCHEMA_VERSION}")
+
+
+def _strict_manifest_value(value: Mapping[str, object]) -> dict[str, object]:
+    """Accept only the complete canonical manifest schema at persistence ingress."""
+    _require_schema(value, "manifest")
+    original = _canonical_object(value)
+    expected = Manifest.from_dict(original).to_dict()
+    if canonical_bytes(original) != canonical_bytes(expected):
+        raise ValueError("manifest must match the complete canonical schema")
+    return expected
 
 
 def _target_statuses(manifest: Mapping[str, object]) -> dict[str, str]:

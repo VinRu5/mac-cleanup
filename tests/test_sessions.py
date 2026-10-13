@@ -115,6 +115,23 @@ class SessionTest(unittest.TestCase):
         session.transition("cache-a", "approved")
         self.assertEqual(session.status("cache-a"), "approved")
 
+    def test_initial_manifest_write_rejects_unknown_or_omitted_default_fields(self) -> None:
+        for name in ("unknown-root", "omitted-status"):
+            with self.subTest(name=name):
+                session = Session.create(self.session_path / name)
+                value = self.manifest.to_dict()
+                if name == "unknown-root":
+                    value["unrecognized"] = True
+                else:
+                    del value["batches"][0]["targets"][0]["status"]  # type: ignore[index]
+
+                with self.assertRaises(ValueError):
+                    session.write_manifest(value)
+
+                self.assertIsNone(session.state["manifest"])
+                self.assertEqual(session.state["targets"], {})
+                self.assertFalse(session.manifest_path.exists())
+
     def test_batch_transition_is_all_or_none_when_state_persistence_is_interrupted(self) -> None:
         second = Target(
             id="cache-b",
