@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
+from .manifests import approve_batch
+from .sessions import InvalidTransition, Session
+
 COMMANDS = ("scan", "plan", "approve", "apply", "verify", "report")
 
 
@@ -15,10 +18,18 @@ def build_parser() -> argparse.ArgumentParser:
     for command in COMMANDS:
         child = subparsers.add_parser(command)
         child.add_argument("--session", required=True)
+        if command == "approve":
+            child.add_argument("--batch", required=True)
+            child.add_argument("--digest", required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse command-line arguments and return a process status code."""
-    build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+    if args.command == "approve":
+        try:
+            approve_batch(Session.load(args.session), args.batch, args.digest)
+        except (FileNotFoundError, InvalidTransition, KeyError, ValueError):
+            return 2
     return 0

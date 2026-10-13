@@ -82,7 +82,11 @@ class Batch:
     targets: tuple[Target, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "targets", tuple(sorted(self.targets, key=lambda target: target.id)))
+        object.__setattr__(
+            self,
+            "targets",
+            tuple(sorted(self.targets, key=lambda target: (target.id, target.canonical))),
+        )
 
     @property
     def batch_id(self) -> str:
@@ -123,6 +127,7 @@ class Manifest:
     schema_version: int = 1
     batches: tuple[Batch, ...] = field(default_factory=tuple)
     issues: tuple[Issue, ...] = field(default_factory=tuple)
+    inventory_digest: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "batches", tuple(sorted(self.batches, key=lambda batch: batch.id)))
@@ -131,6 +136,7 @@ class Manifest:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
+            "inventory_digest": self.inventory_digest,
             "batches": [batch.to_dict() for batch in self.batches],
             "issues": [issue.to_dict() for issue in self.issues],
         }
@@ -141,4 +147,5 @@ class Manifest:
             schema_version=int(value.get("schema_version", 1)),
             batches=tuple(Batch.from_dict(item) for item in value.get("batches", ())),
             issues=tuple(Issue.from_dict(item) for item in value.get("issues", ())),
+            inventory_digest=str(value.get("inventory_digest", "")),
         )
