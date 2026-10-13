@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from pathlib import Path
 
+from .executor import apply_batch, verify_batch
 from .manifests import approve_batch
+from .models import Batch
 from .sessions import InvalidTransition, Session
 
 COMMANDS = ("scan", "plan", "approve", "apply", "verify", "report")
@@ -18,9 +21,12 @@ def build_parser() -> argparse.ArgumentParser:
     for command in COMMANDS:
         child = subparsers.add_parser(command)
         child.add_argument("--session", required=True)
-        if command == "approve":
+        if command in {"approve", "apply", "verify"}:
             child.add_argument("--batch", required=True)
+        if command == "approve":
             child.add_argument("--digest", required=True)
+        if command == "apply":
+            child.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -32,4 +38,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             approve_batch(Session.load(args.session), args.batch, args.digest)
         except (FileNotFoundError, InvalidTransition, KeyError, ValueError):
             return 2
+    elif args.command in {"apply", "verify"}:
+        try:
+            session = Session.load(args.session)
+            batch = _named_batch(session, args.batch)
+            roots = tuple(sorted({str(Path(target.path).parent) for target in batch.targets}))
+            if args.command == "apply":
+                outcome = apply_batch(session, batch, roots, dry_run=args.dry_run)
+            else:
+                outcome = verify_batch(session, batch, roots)
+            if outcome.suspended or any(
+                issue.severity.value in {"batch_error", "critical"}
+                for issue in outcome.issues
+            ):
+                return 2
+        except (FileNotFoundError, InvalidTransition, KeyError, OSError, ValueError):
+            return 2
     return 0
+
+
+def _named_batch(session: Session, batch_id: str) -> Batch:
+    matches = tuple(
+        batch for batch in session.read_manifest().batches if batch.id == batch_id
+    )
+    if len(matches) != 1:
+        raise ValueError(f"unknown manifest batch: {batch_id}")
+    return matches[0]

@@ -6,6 +6,7 @@ from scripts.mac_cleanup.cli import build_parser, main
 from scripts.mac_cleanup.manifests import approval_digest, build_manifest
 from scripts.mac_cleanup.models import Risk, Target
 from scripts.mac_cleanup.modules.base import ScanResult
+from scripts.mac_cleanup.paths import inspect_path
 from scripts.mac_cleanup.sessions import Session
 
 
@@ -17,6 +18,8 @@ class CliTest(unittest.TestCase):
                 args = [command, "--session", "/tmp/session"]
                 if command == "approve":
                     args.extend(("--batch", "safe-user-caches", "--digest", "digest"))
+                elif command in {"apply", "verify"}:
+                    args.extend(("--batch", "safe-user-caches"))
                 value = parser.parse_args(args)
                 self.assertEqual(value.command, command)
 
@@ -24,6 +27,25 @@ class CliTest(unittest.TestCase):
         parser = build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["approve", "--session", "/tmp/session"])
+
+    def test_apply_and_verify_require_an_exact_batch(self) -> None:
+        parser = build_parser()
+        for command in ("apply", "verify"):
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                parser.parse_args([command, "--session", "/tmp/session"])
+
+    def test_apply_accepts_dry_run_but_verify_does_not(self) -> None:
+        parser = build_parser()
+
+        value = parser.parse_args([
+            "apply", "--session", "/tmp/session", "--batch", "safe", "--dry-run"
+        ])
+
+        self.assertTrue(value.dry_run)
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "verify", "--session", "/tmp/session", "--batch", "safe", "--dry-run"
+            ])
 
     def test_approve_mismatch_returns_two_without_transition(self) -> None:
         target = Target(
@@ -58,3 +80,58 @@ class CliTest(unittest.TestCase):
                 ]),
                 0,
             )
+
+    def test_apply_dry_run_and_apply_operate_only_on_the_named_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cache_root = root / "Caches"
+            cache_root.mkdir()
+            targets = []
+            for name in ("first", "second"):
+                path = cache_root / name
+                path.mkdir()
+                (path / "entry.bin").write_bytes(b"cache")
+                identity = inspect_path(path, (cache_root,))
+                targets.append(Target(
+                    id=f"user-caches:{name}",
+                    path=identity.canonical,
+                    kind=identity.kind,
+                    risk=Risk.SAFE_REGENERABLE,
+                    fingerprint=identity.fingerprint,
+                    logical_bytes=identity.logical_bytes,
+                ))
+            inventory = ScanResult(
+                targets=tuple(targets),
+                executable_target_ids=tuple(target.id for target in targets),
+            )
+            policy = {
+                "schema_version": 1,
+                "enabled_modules": ["user-caches"],
+                "preserve_target_ids": [],
+                "allow_review_required": False,
+                "deep_scan_threshold_bytes": 1,
+            }
+            manifest = build_manifest(inventory, policy)
+            session = Session.create(root / "session")
+            session.write_manifest(manifest)
+            digest = approval_digest(manifest, "safe-user-caches")
+            self.assertEqual(main([
+                "approve", "--session", str(session.path),
+                "--batch", "safe-user-caches", "--digest", digest,
+            ]), 0)
+            state_before = Session.load(session.path).state
+
+            self.assertEqual(main([
+                "apply", "--session", str(session.path),
+                "--batch", "safe-user-caches", "--dry-run",
+            ]), 0)
+            self.assertEqual(Session.load(session.path).state, state_before)
+            self.assertTrue(all(Path(target.path).exists() for target in targets))
+
+            self.assertEqual(main([
+                "apply", "--session", str(session.path),
+                "--batch", "safe-user-caches",
+            ]), 0)
+            resumed = Session.load(session.path)
+            self.assertTrue(all(resumed.status(target.id) == "verified" for target in targets))
+            self.assertTrue(all(not Path(target.path).exists() for target in targets))
