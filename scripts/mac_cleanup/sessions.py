@@ -43,6 +43,7 @@ class _LocalSessionLock:
 
 _LOCAL_LOCKS_GUARD = threading.Lock()
 _LOCAL_LOCKS: dict[str, _LocalSessionLock] = {}
+_LOCAL_LOCKS_PID = os.getpid()
 
 
 class InvalidTransition(ValueError):
@@ -53,14 +54,48 @@ class SessionConsistencyError(ValueError):
     """Raised when session artifacts cannot be reconciled safely."""
 
 
+def _close_inherited_lock_descriptor(local: _LocalSessionLock) -> None:
+    """Drop a child's inherited descriptor without unlocking the parent."""
+    if local.pid == os.getpid():
+        return
+    descriptor = local.file_descriptor
+    local.file_descriptor = None
+    local.depth = 0
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _reset_local_locks_after_fork() -> None:
+    """Discard synchronization state and lock descriptors inherited by a child."""
+    global _LOCAL_LOCKS, _LOCAL_LOCKS_GUARD, _LOCAL_LOCKS_PID
+    for local in _LOCAL_LOCKS.values():
+        _close_inherited_lock_descriptor(local)
+    _LOCAL_LOCKS = {}
+    _LOCAL_LOCKS_GUARD = threading.Lock()
+    _LOCAL_LOCKS_PID = os.getpid()
+
+
 def _local_session_lock(path: Path) -> _LocalSessionLock:
+    global _LOCAL_LOCKS_PID
+    if _LOCAL_LOCKS_PID != os.getpid():
+        _reset_local_locks_after_fork()
     key = str(path.resolve(strict=False))
     with _LOCAL_LOCKS_GUARD:
         local = _LOCAL_LOCKS.get(key)
-        if local is None or local.pid != os.getpid():
+        if local is not None and local.pid != os.getpid():
+            _close_inherited_lock_descriptor(local)
+            local = None
+        if local is None:
             local = _LocalSessionLock()
             _LOCAL_LOCKS[key] = local
         return local
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_local_locks_after_fork)
 
 
 class Session:
