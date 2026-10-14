@@ -117,6 +117,7 @@ class Session:
         state: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "created_at": _timestamp(),
+            "admin_scripts": {},
             "critical_stop": None,
             "events": [],
             "issues": [],
@@ -259,6 +260,45 @@ class Session:
         if not isinstance(report, str):
             raise TypeError("report must be text")
         _atomic_write_text(self.report_path, report)
+
+    def bind_admin_script(
+        self, batch_id: str, binding: Mapping[str, object]
+    ) -> None:
+        """Persist one immutable administrative-script binding under the session lock."""
+        if not isinstance(batch_id, str) or not batch_id:
+            raise ValueError("administrative batch id must be non-empty text")
+        value = _canonical_object(_object(binding, "administrative script binding"))
+        with self.operation_lock():
+            current = self._state.get("admin_scripts", {})
+            if not isinstance(current, Mapping):
+                raise SessionConsistencyError("state admin_scripts is malformed")
+            existing = current.get(batch_id)
+            if existing is not None:
+                if existing != value:
+                    raise ValueError(
+                        "administrative script binding is immutable once recorded"
+                    )
+                return
+            next_state = copy.deepcopy(self._state)
+            scripts = next_state.setdefault("admin_scripts", {})
+            assert isinstance(scripts, dict)
+            scripts[batch_id] = value
+            self._persist_state(next_state)
+
+    def admin_script_binding(self, batch_id: str) -> dict[str, object] | None:
+        """Return a copy of the immutable administrative binding for a batch."""
+        with self.operation_lock():
+            scripts = self._state.get("admin_scripts", {})
+            if not isinstance(scripts, Mapping):
+                raise SessionConsistencyError("state admin_scripts is malformed")
+            value = scripts.get(batch_id)
+            if value is None:
+                return None
+            if not isinstance(value, Mapping):
+                raise SessionConsistencyError(
+                    "state administrative script binding is malformed"
+                )
+            return copy.deepcopy(dict(value))
 
     def add_issue(self, issue: Issue | Mapping[str, object]) -> None:
         with self.operation_lock():
@@ -503,6 +543,12 @@ def _validate_state(state: Mapping[str, object]) -> None:
     for key, expected in (("created_at", str), ("events", list), ("issues", list), ("targets", dict)):
         if not isinstance(state.get(key), expected):
             raise ValueError(f"state {key} must be a {expected.__name__}")
+    admin_scripts = state.get("admin_scripts", {})
+    if not isinstance(admin_scripts, Mapping):
+        raise ValueError("state admin_scripts must be an object")
+    for batch_id, binding in admin_scripts.items():
+        if not isinstance(batch_id, str) or not isinstance(binding, Mapping):
+            raise ValueError("state administrative script binding is malformed")
     targets = state["targets"]
     assert isinstance(targets, dict)
     for target_id, status in targets.items():
