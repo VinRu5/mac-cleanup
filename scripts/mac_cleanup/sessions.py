@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import copy
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Mapping, Sequence
+import threading
+from typing import Iterator, Mapping, Sequence
 
 from .jsonio import atomic_write_json, canonical_bytes, read_json
 from .models import Issue, Manifest, Severity, TargetStatus
@@ -28,12 +31,36 @@ ALLOWED_TRANSITIONS = {
 }
 
 
+class _LocalSessionLock:
+    """Process-local reentrancy state layered over an inter-process flock."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self.gate = threading.RLock()
+        self.depth = 0
+        self.file_descriptor: int | None = None
+
+
+_LOCAL_LOCKS_GUARD = threading.Lock()
+_LOCAL_LOCKS: dict[str, _LocalSessionLock] = {}
+
+
 class InvalidTransition(ValueError):
     """Raised when a target lifecycle transition is not explicitly allowed."""
 
 
 class SessionConsistencyError(ValueError):
     """Raised when session artifacts cannot be reconciled safely."""
+
+
+def _local_session_lock(path: Path) -> _LocalSessionLock:
+    key = str(path.resolve(strict=False))
+    with _LOCAL_LOCKS_GUARD:
+        local = _LOCAL_LOCKS.get(key)
+        if local is None or local.pid != os.getpid():
+            local = _LocalSessionLock()
+            _LOCAL_LOCKS[key] = local
+        return local
 
 
 class Session:
@@ -62,7 +89,9 @@ class Session:
             "targets": {},
         }
         atomic_write_json(state_path, state)
-        return cls(directory, state)
+        session = cls(directory, state)
+        session._ensure_lock_file()
+        return session
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "Session":
@@ -71,7 +100,8 @@ class Session:
         state = read_json(directory / "state.json")
         _validate_state(state)
         session = cls(directory, state)
-        session._reconcile_manifest()
+        with session.operation_lock():
+            session._reconcile_manifest()
         return session
 
     @property
@@ -91,13 +121,47 @@ class Session:
         return self.path / "state.json"
 
     @property
+    def lock_path(self) -> Path:
+        return self.path / ".session.lock"
+
+    @property
     def report_path(self) -> Path:
         return self.path / "report.md"
 
     @property
     def state(self) -> dict[str, object]:
         """Return a copy so callers cannot mutate durable state accidentally."""
-        return copy.deepcopy(self._state)
+        with self.operation_lock():
+            return copy.deepcopy(self._state)
+
+    @contextmanager
+    def operation_lock(self) -> Iterator[None]:
+        """Serialize and refresh a complete session operation across processes."""
+        local = _local_session_lock(self.lock_path)
+        local.gate.acquire()
+        outermost = local.depth == 0
+        try:
+            if outermost:
+                descriptor = os.open(
+                    self.lock_path,
+                    os.O_CREAT | os.O_RDWR,
+                    0o600,
+                )
+                os.fchmod(descriptor, 0o600)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                local.file_descriptor = descriptor
+            local.depth += 1
+            self._reload_state_locked()
+            yield
+        finally:
+            if local.depth > 0:
+                local.depth -= 1
+            if outermost and local.file_descriptor is not None:
+                descriptor = local.file_descriptor
+                local.file_descriptor = None
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            local.gate.release()
 
     def write_inventory(self, inventory: Mapping[str, object]) -> None:
         atomic_write_json(self.inventory_path, _object(inventory, "inventory"))
@@ -113,6 +177,12 @@ class Session:
 
     def write_manifest(self, manifest: Manifest | Mapping[str, object]) -> None:
         """Persist an immutable manifest and register its target lifecycle states."""
+        with self.operation_lock():
+            self._write_manifest_locked(manifest)
+
+    def _write_manifest_locked(
+        self, manifest: Manifest | Mapping[str, object]
+    ) -> None:
         value = manifest.to_dict() if isinstance(manifest, Manifest) else _object(manifest, "manifest")
         value = _strict_manifest_value(value)
         target_statuses = _target_statuses(value)
@@ -138,6 +208,10 @@ class Session:
 
     def read_manifest(self) -> Manifest:
         """Read only the exact raw manifest bytes recorded in durable state."""
+        with self.operation_lock():
+            return self._read_manifest_locked()
+
+    def _read_manifest_locked(self) -> Manifest:
         record = _state_manifest_record(self._state)
         if record is not None:
             self._validate_manifest_artifact_bytes(record)
@@ -152,15 +226,20 @@ class Session:
         _atomic_write_text(self.report_path, report)
 
     def add_issue(self, issue: Issue | Mapping[str, object]) -> None:
-        value = issue.to_dict() if isinstance(issue, Issue) else _object(issue, "issue")
-        next_state = copy.deepcopy(self._state)
-        issues = next_state["issues"]
-        assert isinstance(issues, list)
-        issues.append({"at": _timestamp(), **value})
-        self._persist_state(next_state)
+        with self.operation_lock():
+            value = issue.to_dict() if isinstance(issue, Issue) else _object(issue, "issue")
+            next_state = copy.deepcopy(self._state)
+            issues = next_state["issues"]
+            assert isinstance(issues, list)
+            issues.append({"at": _timestamp(), **value})
+            self._persist_state(next_state)
 
     def critical_issue(self) -> Issue | None:
         """Return the durable global-stop cause, if one has been latched."""
+        with self.operation_lock():
+            return self._critical_issue_locked()
+
+    def _critical_issue_locked(self) -> Issue | None:
         value = self._state.get("critical_stop")
         if value is None:
             return None
@@ -173,17 +252,22 @@ class Session:
             raise TypeError("critical stop must be an Issue")
         if issue.severity is not Severity.CRITICAL:
             raise ValueError("critical stop issue must have critical severity")
-        if self.critical_issue() is not None:
-            return
-        record = {"at": _timestamp(), **issue.to_dict()}
-        next_state = copy.deepcopy(self._state)
-        next_state["critical_stop"] = record
-        issues = next_state["issues"]
-        assert isinstance(issues, list)
-        issues.append(record.copy())
-        self._persist_state(next_state)
+        with self.operation_lock():
+            if self._critical_issue_locked() is not None:
+                return
+            record = {"at": _timestamp(), **issue.to_dict()}
+            next_state = copy.deepcopy(self._state)
+            next_state["critical_stop"] = record
+            issues = next_state["issues"]
+            assert isinstance(issues, list)
+            issues.append(record.copy())
+            self._persist_state(next_state)
 
     def status(self, target_id: str) -> str:
+        with self.operation_lock():
+            return self._status_locked(target_id)
+
+    def _status_locked(self, target_id: str) -> str:
         target = self._targets().get(target_id)
         if target is None:
             raise KeyError(f"target is absent from session manifest: {target_id}")
@@ -197,6 +281,12 @@ class Session:
         self, target_ids: Sequence[str], destination: str | TargetStatus
     ) -> None:
         """Atomically transition every supplied target after validating all of them."""
+        with self.operation_lock():
+            self._transition_batch_locked(target_ids, destination)
+
+    def _transition_batch_locked(
+        self, target_ids: Sequence[str], destination: str | TargetStatus
+    ) -> None:
         identifiers = tuple(target_ids)
         if not identifiers:
             raise ValueError("batch transition requires at least one target")
@@ -205,7 +295,7 @@ class Session:
         next_status = TargetStatus(destination).value
         current_statuses: list[tuple[str, str]] = []
         for target_id in identifiers:
-            current_status = self.status(target_id)
+            current_status = self._status_locked(target_id)
             if next_status not in ALLOWED_TRANSITIONS[current_status]:
                 raise InvalidTransition(
                     f"cannot transition {target_id}: {current_status} -> {next_status}"
@@ -234,6 +324,18 @@ class Session:
         targets = self._state["targets"]
         assert isinstance(targets, dict)
         return targets  # type: ignore[return-value]
+
+    def _ensure_lock_file(self) -> None:
+        descriptor = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+    def _reload_state_locked(self) -> None:
+        state = read_json(self.state_path)
+        _validate_state(state)
+        self._state = state
 
     def _persist_state(self, state: dict[str, object]) -> None:
         _validate_state(state)

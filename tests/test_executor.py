@@ -1,14 +1,41 @@
 import os
 import fcntl
+import multiprocessing
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from scripts.mac_cleanup.executor import apply_batch, preflight_target, verify_batch
-from scripts.mac_cleanup.models import Batch, Manifest, Risk, Severity, Target
+from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Severity, Target
 from scripts.mac_cleanup.paths import PathSafetyError, inspect_path, remove_tree_exact
 from scripts.mac_cleanup.sessions import Session
+
+
+def _apply_in_forked_process(
+    session_path: str,
+    batch_id: str,
+    allowed_root: str,
+    attempted: object,
+    results: object,
+) -> None:
+    attempted.set()  # type: ignore[attr-defined]
+    session = Session.load(session_path)
+    batch = next(
+        candidate
+        for candidate in session.read_manifest().batches
+        if candidate.id == batch_id
+    )
+    outcome = apply_batch(session, batch, (allowed_root,))
+    results.put(  # type: ignore[attr-defined]
+        {
+            "critical": any(
+                issue.severity is Severity.CRITICAL for issue in outcome.issues
+            ),
+            "suspended": outcome.suspended,
+        }
+    )
 
 
 class ExecutorTest(unittest.TestCase):
@@ -133,6 +160,126 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn(Severity.CRITICAL, {issue.severity for issue in outcome.issues})
         self.assertTrue(Path(independent.path).exists())
         self.assertEqual(resumed.status(independent.id), "approved")
+
+    def test_stale_sessions_cannot_apply_or_verify_after_newer_latch(self) -> None:
+        critical_target = self._target("cache-a")
+        apply_target = self._target("cache-b")
+        verify_target = self._target("cache-c")
+        first = Batch("safe-a", (critical_target,))
+        second = Batch("safe-b", (apply_target,))
+        third = Batch("safe-c", (verify_target,))
+        self._write_and_approve(first, second, third)
+        self.session.transition(verify_target.id, "applied")
+        latch_owner = Session.load(self.session.path)
+        stale_dry_run = Session.load(self.session.path)
+        stale_apply = Session.load(self.session.path)
+        stale_verify = Session.load(self.session.path)
+        critical = Issue(
+            "executor.symlink-or-outside",
+            Severity.CRITICAL,
+            "unsafe target",
+            critical_target.id,
+        )
+
+        latch_owner.latch_critical(critical)
+        dry_run_outcome = apply_batch(
+            stale_dry_run, second, (self.allowed_root,), dry_run=True
+        )
+        apply_outcome = apply_batch(stale_apply, second, (self.allowed_root,))
+        verify_outcome = verify_batch(stale_verify, third, (self.allowed_root,))
+
+        resumed = Session.load(self.session.path)
+        self.assertEqual(resumed.critical_issue(), critical)
+        self.assertTrue(dry_run_outcome.dry_run)
+        self.assertIn(Severity.CRITICAL, {i.severity for i in dry_run_outcome.issues})
+        self.assertIn(Severity.CRITICAL, {i.severity for i in apply_outcome.issues})
+        self.assertIn(Severity.CRITICAL, {i.severity for i in verify_outcome.issues})
+        self.assertTrue(Path(apply_target.path).exists())
+        self.assertTrue(Path(verify_target.path).exists())
+        self.assertEqual(resumed.status(apply_target.id), "approved")
+        self.assertEqual(resumed.status(verify_target.id), "applied")
+
+    def test_operation_lock_serializes_interleaved_apply_before_latch_check(self) -> None:
+        critical_target = self._target("cache-a")
+        apply_target = self._target("cache-b")
+        first = Batch("safe-a", (critical_target,))
+        second = Batch("safe-b", (apply_target,))
+        self._write_and_approve(first, second)
+        latch_owner = Session.load(self.session.path)
+        concurrent = Session.load(self.session.path)
+        attempted = threading.Event()
+        completed = threading.Event()
+        outcomes = []
+        errors = []
+
+        def run_apply() -> None:
+            attempted.set()
+            try:
+                outcomes.append(
+                    apply_batch(concurrent, second, (self.allowed_root,))
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
+        critical = Issue(
+            "executor.symlink-or-outside",
+            Severity.CRITICAL,
+            "unsafe target",
+            critical_target.id,
+        )
+        with latch_owner.operation_lock():
+            worker = threading.Thread(target=run_apply)
+            worker.start()
+            self.assertTrue(attempted.wait(timeout=1))
+            latch_owner.latch_critical(critical)
+        self.assertTrue(completed.wait(timeout=2))
+        worker.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(outcomes), 1)
+        self.assertIn(Severity.CRITICAL, {i.severity for i in outcomes[0].issues})
+        self.assertTrue(Path(apply_target.path).exists())
+        self.assertEqual(Session.load(self.session.path).critical_issue(), critical)
+
+    def test_forked_apply_reloads_latch_after_interprocess_lock_acquisition(self) -> None:
+        critical_target = self._target("cache-a")
+        apply_target = self._target("cache-b")
+        first = Batch("safe-a", (critical_target,))
+        second = Batch("safe-b", (apply_target,))
+        self._write_and_approve(first, second)
+        latch_owner = Session.load(self.session.path)
+        context = multiprocessing.get_context("fork")
+        attempted = context.Event()
+        results = context.Queue()
+        critical = Issue(
+            "executor.symlink-or-outside",
+            Severity.CRITICAL,
+            "unsafe target",
+            critical_target.id,
+        )
+
+        with latch_owner.operation_lock():
+            worker = context.Process(
+                target=_apply_in_forked_process,
+                args=(
+                    str(self.session.path),
+                    second.id,
+                    str(self.allowed_root),
+                    attempted,
+                    results,
+                ),
+            )
+            worker.start()
+            self.assertTrue(attempted.wait(timeout=2))
+            latch_owner.latch_critical(critical)
+        worker.join(timeout=5)
+
+        self.assertEqual(worker.exitcode, 0)
+        self.assertEqual(results.get(timeout=1), {"critical": True, "suspended": True})
+        self.assertTrue(Path(apply_target.path).exists())
+        self.assertEqual(Session.load(self.session.path).critical_issue(), critical)
 
     def test_critical_dry_run_reports_without_latching_or_transitioning(self) -> None:
         replaced = self._target("cache-a")

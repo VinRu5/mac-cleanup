@@ -64,6 +64,17 @@ def apply_batch(
 ) -> BatchOutcome:
     """Preflight an entire approved batch, then remove each exact identity."""
     roots = tuple(allowed_roots)
+    with session.operation_lock():
+        return _apply_batch_locked(session, batch, roots, dry_run=dry_run)
+
+
+def _apply_batch_locked(
+    session: Session,
+    batch: Batch,
+    roots: tuple[str | os.PathLike[str], ...],
+    *,
+    dry_run: bool,
+) -> BatchOutcome:
     persisted = _approved_session_batch(session, batch)
     latched = session.critical_issue()
     if latched is not None:
@@ -184,6 +195,15 @@ def verify_batch(
 ) -> BatchOutcome:
     """Explicitly verify absence; never remove a target."""
     roots = tuple(allowed_roots)
+    with session.operation_lock():
+        return _verify_batch_locked(session, batch, roots)
+
+
+def _verify_batch_locked(
+    session: Session,
+    batch: Batch,
+    roots: tuple[str | os.PathLike[str], ...],
+) -> BatchOutcome:
     persisted = _approved_session_batch(session, batch)
     latched = session.critical_issue()
     if latched is not None:

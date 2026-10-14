@@ -85,6 +85,26 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(resumed.state["critical_stop"]["code"], critical.code)
         self.assertEqual(resumed.state["issues"][-1]["code"], critical.code)
 
+    def test_stale_session_transition_cannot_erase_a_newer_critical_latch(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        latch_owner = Session.load(self.session_path)
+        stale_writer = Session.load(self.session_path)
+        critical = Issue(
+            "executor.symlink-or-outside",
+            Severity.CRITICAL,
+            "unsafe target",
+            "cache-a",
+        )
+
+        latch_owner.latch_critical(critical)
+        stale_writer.transition("cache-a", "approved")
+
+        resumed = Session.load(self.session_path)
+        self.assertEqual(resumed.critical_issue(), critical)
+        self.assertEqual(resumed.status("cache-a"), "approved")
+        self.assertEqual(resumed.state["issues"][-1]["code"], critical.code)
+
     def test_reload_resumes_once_without_inferring_missing_state_as_success(self) -> None:
         session = Session.create(self.session_path)
         session.write_manifest(self.manifest)
