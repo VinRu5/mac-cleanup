@@ -4,13 +4,17 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.mac_cleanup.admin_script import (
+    _BOOTSTRAP,
+    _VERIFIER_SOURCE,
     generate_admin_script,
     import_admin_results,
     quote_zsh_literal,
 )
-from scripts.mac_cleanup.models import Batch, Manifest, Risk, Target
+from scripts.mac_cleanup.executor import apply_batch
+from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Target
 from scripts.mac_cleanup.paths import inspect_path
 from scripts.mac_cleanup.sessions import Session
 
@@ -105,7 +109,7 @@ class AdminScriptTest(unittest.TestCase):
         self.assertNotIn("*", first)
         binding = self.session.state["admin_scripts"][batch.id]
         self.assertEqual(binding["checksum"], checksum)
-        self.assertRegex(binding["engine_digest"], r"^[0-9a-f]{64}$")
+        self.assertRegex(binding["snapshot_digest"], r"^[0-9a-f]{64}$")
         self.assertEqual(binding["result_path"], str(result_path))
 
     def test_script_executes_only_the_approved_fixture_target(self) -> None:
@@ -207,19 +211,16 @@ class AdminScriptTest(unittest.TestCase):
         first = Batch("safe-user-caches", (completed_target, missing_target))
         second = Batch("review-user-caches", (independent_target,))
         self._register(first, second)
-        checksum, script_path, result_path = self._generate(first)
-        os.unlink(missing_target.path + "/entry.bin")
-        os.rmdir(missing_target.path)
-        script_lines = script_path.read_text(encoding="utf-8").splitlines()
-        script_path.write_text("\n".join(script_lines[:3]) + "\n", encoding="utf-8")
-        os.chmod(script_path, 0o700)
-        # Bind the deliberately shortened execution by restoring the original
-        # after the first verifier call; import must still use result presence,
-        # not assume whole-script success.
-        original = "\n".join(script_lines) + "\n"
-        subprocess.run((str(script_path),), check=True)
-        script_path.write_text(original, encoding="utf-8")
-        os.chmod(script_path, 0o700)
+        checksum, _, result_path = self._generate(first)
+        os.unlink(completed_target.path + "/entry.bin")
+        os.rmdir(completed_target.path)
+        results = json.loads(result_path.read_text(encoding="utf-8"))
+        results["targets"][completed_target.id] = {
+            "issues": [],
+            "logical_bytes_removed": completed_target.logical_bytes,
+            "status": "verified",
+        }
+        result_path.write_text(json.dumps(results), encoding="utf-8")
 
         import_admin_results(
             self.session,
@@ -323,11 +324,10 @@ class AdminScriptTest(unittest.TestCase):
         batch = Batch("safe-user-caches", (target, later))
         self._register(batch)
         _, script_path, result_path = self._generate(batch)
-        first_line = script_path.read_text(encoding="utf-8").splitlines()[2]
-        one_target = "#!/bin/zsh\nset -eu\n" + first_line + "\n"
-        script_path.write_text(one_target, encoding="utf-8")
-        os.chmod(script_path, 0o700)
-        subprocess.run((str(script_path),), check=True)
+        (Path(later.path) / "entry.bin").write_bytes(b"changed")
+        first = subprocess.run((str(script_path),), check=False)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertFalse(Path(target.path).exists())
         recreated = Path(target.path)
         recreated.mkdir()
         (recreated / "new.bin").write_bytes(b"new")
@@ -376,6 +376,254 @@ class AdminScriptTest(unittest.TestCase):
                 trusted_home=self.home,
             )
         self.assertTrue(Path(independent.path).exists())
+
+    def test_latch_written_while_script_waits_for_session_lock_stops_deletion(self) -> None:
+        target = self._target("lock-waiter")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+        process: subprocess.Popen[str] | None = None
+
+        with self.session.operation_lock():
+            process = subprocess.Popen(
+                (str(script_path),),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            critical = {
+                "code": "test.critical",
+                "severity": "critical",
+                "message": "stop before fallback",
+                "target_id": target.id,
+            }
+            self.session.latch_critical(Issue.from_dict(critical))
+
+        assert process is not None
+        _, stderr = process.communicate(timeout=5)
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertTrue(Path(target.path).exists())
+        self.assertEqual(self.session.status(target.id), "approved")
+
+    def test_status_change_while_script_waits_for_lock_stops_deletion(self) -> None:
+        target = self._target("status-race")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+
+        with self.session.operation_lock():
+            process = subprocess.Popen(
+                (str(script_path),),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.session.transition(target.id, "applied")
+
+        _, stderr = process.communicate(timeout=5)
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertTrue(Path(target.path).exists())
+        self.assertEqual(self.session.status(target.id), "applied")
+
+    def test_direct_apply_serializes_with_generated_execution(self) -> None:
+        target = self._target("direct-race")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, result_path = self._generate(batch)
+
+        with self.session.operation_lock():
+            process = subprocess.Popen(
+                (str(script_path),),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            outcome = apply_batch(self.session, batch, (self.cache_root,))
+
+        _, stderr = process.communicate(timeout=5)
+        self.assertFalse(outcome.suspended)
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertFalse(Path(target.path).exists())
+        self.assertEqual(self.session.status(target.id), "verified")
+        results = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(results["targets"], {})
+
+    def test_isolated_python_ignores_hostile_cwd_and_sitecustomize(self) -> None:
+        target = self._target("isolated")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+        hostile = self.root / "hostile"
+        hostile.mkdir()
+        marker = hostile / "marker"
+        payload = (
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+            "raise RuntimeError('hostile module loaded')\n"
+        )
+        for name in ("hashlib.py", "pathlib.py", "sitecustomize.py"):
+            (hostile / name).write_text(payload, encoding="utf-8")
+
+        completed = subprocess.run(
+            (str(script_path),),
+            cwd=hostile,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse(Path(target.path).exists())
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn("'-I' '-S'", script)
+
+    def test_modified_script_fails_before_mutation(self) -> None:
+        target = self._target("script-tamper")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+        script_path.write_text(
+            script_path.read_text(encoding="utf-8") + "# tampered\n",
+            encoding="utf-8",
+        )
+        os.chmod(script_path, 0o700)
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(Path(target.path).exists())
+
+    def test_changed_durable_admin_checksum_fails_before_mutation(self) -> None:
+        target = self._target("binding-tamper")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+        state_path = self.session.state_path
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["admin_scripts"][batch.id]["checksum"] = "0" * 64
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(Path(target.path).exists())
+
+    def test_result_mode_anomaly_fails_before_mutation(self) -> None:
+        target = self._target("mode-result")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, result_path = self._generate(batch)
+        os.chmod(result_path, 0o644)
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(Path(target.path).exists())
+
+    def test_malformed_existing_result_fails_before_mutation(self) -> None:
+        target = self._target("malformed-result")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, result_path = self._generate(batch)
+        results = json.loads(result_path.read_text(encoding="utf-8"))
+        results["targets"][target.id] = {"status": "verified"}
+        result_path.write_text(json.dumps(results), encoding="utf-8")
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(Path(target.path).exists())
+
+    def test_snapshot_mode_anomaly_fails_before_mutation(self) -> None:
+        target = self._target("mode-snapshot")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+        binding = self.session.state["admin_scripts"][batch.id]
+        os.chmod(Path(binding["snapshot_path"]), 0o644)
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(Path(target.path).exists())
+
+    def test_verifier_snapshot_tamper_fails_before_mutation(self) -> None:
+        target = self._target("snapshot-tamper")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+        binding = self.session.state["admin_scripts"][batch.id]
+        snapshot = Path(binding["snapshot_path"])
+        snapshot.write_text(
+            snapshot.read_text(encoding="utf-8") + "# tampered\n",
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(Path(target.path).exists())
+
+    def test_snapshot_is_self_contained_and_result_preserves_session_owner(self) -> None:
+        target = self._target("owned")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, result_path = self._generate(batch)
+        binding = self.session.state["admin_scripts"][batch.id]
+        snapshot = Path(binding["snapshot_path"])
+        snapshot_text = snapshot.read_text(encoding="utf-8")
+
+        self.assertEqual(snapshot_text, _VERIFIER_SOURCE)
+        self.assertNotIn("scripts.mac_cleanup", snapshot_text)
+        self.assertNotIn("sys.path", snapshot_text)
+        completed = subprocess.run((str(script_path),), check=False)
+        self.assertEqual(completed.returncode, 0)
+        session_stat = self.session.path.stat()
+        result_stat = result_path.stat()
+        self.assertEqual(result_stat.st_uid, session_stat.st_uid)
+        self.assertEqual(result_stat.st_gid, session_stat.st_gid)
+        self.assertEqual(result_stat.st_mode & 0o777, 0o600)
+
+    def test_bootstrap_executes_only_the_once_read_verified_snapshot_bytes(self) -> None:
+        self.assertEqual(_BOOTSTRAP.count("os.open(sys.argv[1]"), 1)
+        self.assertEqual(_BOOTSTRAP.count("os.read(f"), 1)
+        self.assertIn("hashlib.sha256(b)", _BOOTSTRAP)
+        self.assertIn("exec(compile(b,p", _BOOTSTRAP)
+        self.assertNotIn("read_bytes", _BOOTSTRAP)
+
+    def test_snapshot_privileged_writer_fchowns_temp_to_bound_owner(self) -> None:
+        namespace = {"__name__": "verifier_test"}
+        exec(compile(_VERIFIER_SOURCE, "<verifier>", "exec"), namespace)
+        calls: list[tuple[int, int]] = []
+        real_fchown = os.fchown
+
+        def record_fchown(descriptor: int, uid: int, gid: int) -> None:
+            calls.append((uid, gid))
+            real_fchown(descriptor, os.getuid(), os.getgid())
+
+        destination = self.session.path / "owner-simulation.json"
+        with patch.object(namespace["os"], "geteuid", return_value=0), patch.object(
+            namespace["os"], "fchown", side_effect=record_fchown
+        ):
+            namespace["_atomic_write_json_owned"](
+                str(destination), {"ok": True}, os.getuid(), os.getgid()
+            )
+
+        self.assertIn((os.getuid(), os.getgid()), calls)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

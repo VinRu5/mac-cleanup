@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import os
 from pathlib import Path
 import pwd
@@ -12,18 +11,11 @@ import re
 import stat
 import sys
 import tempfile
-from typing import Mapping, Sequence
+from typing import Mapping
 
-from .executor import (
-    _absence_issue,
-    _issue_from_safety_error,
-    _os_issue,
-    _permission_issue,
-    _preflight_target,
-)
-from .jsonio import atomic_write_json, canonical_bytes, read_json
-from .models import Batch, Issue, Risk, Severity, Target
-from .paths import PathSafetyError, remove_tree_exact
+from .executor import _preflight_target
+from .jsonio import canonical_bytes, read_json
+from .models import Batch, Issue, Risk, Severity
 from .sessions import Session
 
 
@@ -33,25 +25,27 @@ _SUPPORTED_BATCH_RISKS = {
     "review-user-caches": Risk.REVIEW_REQUIRED,
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_ENGINE_FILES = (
-    "scripts/mac_cleanup/admin_script.py",
-    "scripts/mac_cleanup/executor.py",
-    "scripts/mac_cleanup/jsonio.py",
-    "scripts/mac_cleanup/models.py",
-    "scripts/mac_cleanup/paths.py",
-)
+_VERIFIER_BYTES = Path(__file__).with_name("admin_verifier.py").read_bytes()
+_VERIFIER_SOURCE = _VERIFIER_BYTES.decode("utf-8")
 _BOOTSTRAP = (
-    "import hashlib,pathlib,sys;"
-    "root=pathlib.Path(sys.argv[1]);"
-    "h=hashlib.sha256();"
-    "names=('scripts/mac_cleanup/admin_script.py','scripts/mac_cleanup/executor.py',"
-    "'scripts/mac_cleanup/jsonio.py','scripts/mac_cleanup/models.py',"
-    "'scripts/mac_cleanup/paths.py');"
-    "[(h.update(name.encode()),h.update((root/name).read_bytes())) for name in names];"
-    "h.hexdigest()==sys.argv[2] or sys.exit(65);"
-    "sys.path.insert(0,sys.argv[1]);"
-    "from scripts.mac_cleanup.admin_script import _generated_entry;"
-    "raise SystemExit(_generated_entry(tuple(sys.argv[3:])))"
+    "import hashlib,hmac,os,stat,sys;"
+    "f=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW);"
+    "a=os.fstat(f);"
+    "a.st_size<=16777216 or sys.exit(65);"
+    "b=os.read(f,a.st_size+1);"
+    "z=os.fstat(f);"
+    "os.close(f);"
+    "stat.S_ISREG(a.st_mode)or sys.exit(65);"
+    "stat.S_IMODE(a.st_mode)==0o600 or sys.exit(65);"
+    "(a.st_uid,a.st_gid)==(int(sys.argv[12]),int(sys.argv[13]))or sys.exit(65);"
+    "(a.st_dev,a.st_ino,a.st_size,a.st_mtime_ns)=="
+    "(z.st_dev,z.st_ino,z.st_size,z.st_mtime_ns)or sys.exit(65);"
+    "len(b)==a.st_size or sys.exit(65);"
+    "hmac.compare_digest(hashlib.sha256(b).hexdigest(),sys.argv[2])or sys.exit(65);"
+    "p=sys.argv[1];"
+    "sys.argv=[p]+sys.argv[3:];"
+    "g={'__name__':'__main__','__file__':p};"
+    "exec(compile(b,p,'exec'),g,g)"
 )
 
 
@@ -82,7 +76,10 @@ def generate_admin_script(
         raise TypeError("batch must be a Batch")
     output = _session_artifact_path(output_path, "script")
     result = _session_artifact_path(result_path, "result")
-    if output.parent != result.parent or output == result:
+    snapshot = _session_artifact_path(
+        output.with_name(f".{output.name}.verifier.py"), "verifier snapshot"
+    )
+    if output.parent != result.parent or len({output, result, snapshot}) != 3:
         raise ValueError("administrative artifacts must be distinct session files")
     session = Session.load(result.parent)
     home = _trusted_home(trusted_home)
@@ -94,14 +91,22 @@ def generate_admin_script(
         persisted = _approved_session_batch(session, batch)
         _validate_batch_location(persisted, allowed_root)
         manifest_digest = _manifest_digest(session)
-        engine_digest = _engine_digest()
+        session_stat = session.path.stat()
+        if not stat.S_ISDIR(session_stat.st_mode):
+            raise ValueError("session path must be a directory")
+        session_uid = session_stat.st_uid
+        session_gid = session_stat.st_gid
+        snapshot_digest = hashlib.sha256(_VERIFIER_BYTES).hexdigest()
         operation_digest = _operation_digest(
             persisted,
             manifest_digest,
             output,
             result,
+            snapshot,
+            snapshot_digest,
             allowed_root,
-            engine_digest,
+            session_uid,
+            session_gid,
         )
         initial_results = {
             "schema_version": RESULT_SCHEMA_VERSION,
@@ -111,30 +116,55 @@ def generate_admin_script(
             "targets": {},
         }
         script = _render_script(
-            persisted, result, operation_digest, allowed_root, engine_digest
+            persisted,
+            session.path,
+            output,
+            result,
+            snapshot,
+            snapshot_digest,
+            operation_digest,
+            manifest_digest,
+            allowed_root,
+            session_uid,
+            session_gid,
         )
         payload = script.encode("utf-8")
         checksum = hashlib.sha256(payload).hexdigest()
         binding = {
             "allowed_root": str(allowed_root),
+            "batch": persisted.to_dict(),
             "batch_id": persisted.id,
             "checksum": checksum,
-            "engine_digest": engine_digest,
             "manifest_digest": manifest_digest,
             "operation_digest": operation_digest,
             "output_path": str(output),
             "result_path": str(result),
+            "session_gid": session_gid,
+            "session_uid": session_uid,
+            "snapshot_digest": snapshot_digest,
+            "snapshot_path": str(snapshot),
             "target_ids": [target.id for target in persisted.targets],
         }
         existing = session.admin_script_binding(persisted.id)
         if existing is not None and existing != binding:
             raise ValueError("administrative script binding is immutable")
-        _atomic_write_script(output, payload)
+        _atomic_write_bytes_owned(
+            snapshot, _VERIFIER_BYTES, session_uid, session_gid, 0o600
+        )
+        _atomic_write_bytes_owned(output, payload, session_uid, session_gid, 0o700)
         if os.path.lexists(result):
-            _require_regular_file(result, "administrative result")
+            _require_owned_regular_file(
+                result, "administrative result", session_uid, session_gid, 0o600
+            )
             _validate_result_binding(read_json(result), initial_results)
         else:
-            atomic_write_json(result, initial_results)
+            _atomic_write_bytes_owned(
+                result,
+                canonical_bytes(initial_results),
+                session_uid,
+                session_gid,
+                0o600,
+            )
         session.bind_admin_script(persisted.id, binding)
         return checksum
 
@@ -175,13 +205,27 @@ def import_admin_results(
         if not hmac.compare_digest(binding["checksum"], expected_checksum):
             raise ValueError("administrative checksum differs from durable state")
         script_path = Path(binding["output_path"])
-        _require_regular_file(script_path, "administrative script")
+        snapshot_path = Path(binding["snapshot_path"])
+        _require_owned_regular_file(
+            script_path,
+            "administrative script",
+            binding["session_uid"],
+            binding["session_gid"],
+            0o700,
+        )
         actual_checksum = hashlib.sha256(script_path.read_bytes()).hexdigest()
         if not hmac.compare_digest(actual_checksum, expected_checksum):
             raise ValueError("administrative script differs from its checksum")
-        engine_digest = _engine_digest()
-        if binding["engine_digest"] != engine_digest:
-            raise ValueError("administrative verifier engine differs from its binding")
+        _require_owned_regular_file(
+            snapshot_path,
+            "administrative verifier snapshot",
+            binding["session_uid"],
+            binding["session_gid"],
+            0o600,
+        )
+        snapshot_digest = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+        if not hmac.compare_digest(snapshot_digest, binding["snapshot_digest"]):
+            raise ValueError("administrative verifier differs from its binding")
         batch = _named_batch(session, binding["batch_id"])
         persisted = _approved_or_resumable_batch(session, batch)
         _validate_batch_location(persisted, allowed_root)
@@ -191,19 +235,30 @@ def import_admin_results(
             manifest_digest,
             script_path,
             result,
+            snapshot_path,
+            binding["snapshot_digest"],
             allowed_root,
-            engine_digest,
+            binding["session_uid"],
+            binding["session_gid"],
         )
         if binding["manifest_digest"] != manifest_digest:
             raise ValueError("administrative binding targets a different manifest")
         if binding["allowed_root"] != str(allowed_root):
             raise ValueError("administrative binding targets a different module root")
+        if binding["batch"] != persisted.to_dict():
+            raise ValueError("administrative binding targets a different batch")
         if binding["operation_digest"] != expected_operation:
             raise ValueError("administrative binding is inconsistent")
         if not os.path.lexists(result):
             _suspend_missing_result_file(session, persisted, result)
             return
-        _require_regular_file(result, "administrative result")
+        _require_owned_regular_file(
+            result,
+            "administrative result",
+            binding["session_uid"],
+            binding["session_gid"],
+            0o600,
+        )
         results = read_json(result)
         expected_result = {
             "schema_version": RESULT_SCHEMA_VERSION,
@@ -218,147 +273,47 @@ def import_admin_results(
 
 def _render_script(
     batch: Batch,
+    session_path: Path,
+    output_path: Path,
     result_path: Path,
+    snapshot_path: Path,
+    snapshot_digest: str,
     operation_digest: str,
+    manifest_digest: str,
     allowed_root: Path,
-    engine_digest: str,
+    session_uid: int,
+    session_gid: int,
 ) -> str:
     executable = str(Path(sys.executable).resolve(strict=True))
-    module_root = str(Path(__file__).resolve(strict=True).parents[2])
     lines = ["#!/bin/zsh", "set -eu"]
     for target in batch.targets:
+        target_json = canonical_bytes(target.to_dict()).decode("utf-8")
         arguments = (
             executable,
+            "-I",
+            "-S",
             "-c",
             _BOOTSTRAP,
-            module_root,
-            engine_digest,
+            str(snapshot_path),
+            snapshot_digest,
+            str(session_path),
+            str(snapshot_path),
+            snapshot_digest,
+            str(output_path),
             str(result_path),
             operation_digest,
             batch.id,
+            target_json,
+            str(allowed_root),
+            str(session_uid),
+            str(session_gid),
+            manifest_digest,
             target.id,
             target.path,
-            target.kind,
-            target.risk.value,
             target.fingerprint,
-            str(target.logical_bytes),
-            str(allowed_root),
         )
         lines.append(" ".join(quote_zsh_literal(argument) for argument in arguments))
     return "\n".join(lines) + "\n"
-
-
-def _generated_entry(arguments: Sequence[str]) -> int:
-    """Verify and delete one exact target; used only by a generated script."""
-    if len(arguments) != 10:
-        return 64
-    (
-        result_text,
-        operation_digest,
-        batch_id,
-        target_id,
-        target_path,
-        target_kind,
-        target_risk,
-        target_fingerprint,
-        logical_bytes_text,
-        allowed_root_text,
-    ) = arguments
-    try:
-        result_path = Path(result_text)
-        allowed_root = Path(allowed_root_text)
-        _require_regular_file(result_path, "administrative result")
-        results = read_json(result_path)
-        records = _validate_result_binding(
-            results,
-            {
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "batch_id": batch_id,
-                "operation_digest": operation_digest,
-                "target_ids": results.get("target_ids"),
-                "targets": {},
-            },
-        )
-        target_ids = results["target_ids"]
-        if target_id not in target_ids:
-            return 64
-        target = Target(
-            id=target_id,
-            path=target_path,
-            kind=target_kind,
-            risk=Risk(target_risk),
-            fingerprint=target_fingerprint,
-            logical_bytes=int(logical_bytes_text),
-        )
-        _validate_batch_location(Batch(batch_id, (target,)), allowed_root)
-        preflight = _preflight_target(target, (allowed_root,))
-        if preflight.issues:
-            absent = any(
-                issue.code == "executor.target-absent" for issue in preflight.issues
-            )
-            if absent and all(
-                issue.severity is Severity.INFORMATIONAL
-                for issue in preflight.issues
-            ):
-                _write_target_result(
-                    result_path, results, target_id, "verified", preflight.issues, 0
-                )
-                return 0
-            _write_target_result(
-                result_path, results, target_id, "suspended", preflight.issues, 0
-            )
-            return _issue_exit_code(preflight.issues)
-        assert preflight.identity is not None
-        try:
-            removed = remove_tree_exact(preflight.identity, (allowed_root,))
-        except PathSafetyError as error:
-            issues = (_issue_from_safety_error(target, error),)
-            _write_target_result(
-                result_path, results, target_id, "suspended", issues, 0
-            )
-            return _issue_exit_code(issues)
-        except PermissionError as error:
-            issues = (_permission_issue(target, error),)
-            _write_target_result(
-                result_path, results, target_id, "suspended", issues, 0
-            )
-            return 3
-        except OSError as error:
-            issues = (_os_issue(target, error),)
-            _write_target_result(
-                result_path, results, target_id, "suspended", issues, 0
-            )
-            return _issue_exit_code(issues)
-        postcondition = _absence_issue(target, (allowed_root,))
-        if postcondition is not None:
-            issues = (postcondition,)
-            _write_target_result(
-                result_path, results, target_id, "suspended", issues, removed
-            )
-            return _issue_exit_code(issues)
-        _write_target_result(result_path, results, target_id, "verified", (), removed)
-        return 0
-    except (KeyError, TypeError, ValueError, OSError, PathSafetyError):
-        return 64
-
-
-def _write_target_result(
-    path: Path,
-    results: dict[str, object],
-    target_id: str,
-    status: str,
-    issues: Sequence[Issue],
-    logical_bytes_removed: int,
-) -> None:
-    next_value = json.loads(canonical_bytes(results).decode("utf-8"))
-    targets = next_value["targets"]
-    assert isinstance(targets, dict)
-    targets[target_id] = {
-        "issues": [issue.to_dict() for issue in issues],
-        "logical_bytes_removed": logical_bytes_removed,
-        "status": status,
-    }
-    atomic_write_json(path, next_value)
 
 
 def _import_target_records(
@@ -527,27 +482,24 @@ def _operation_digest(
     manifest_digest: str,
     output_path: Path,
     result_path: Path,
+    snapshot_path: Path,
+    snapshot_digest: str,
     allowed_root: Path,
-    engine_digest: str,
+    session_uid: int,
+    session_gid: int,
 ) -> str:
     value = {
         "allowed_root": str(allowed_root),
         "batch": batch.to_dict(),
-        "engine_digest": engine_digest,
         "manifest_digest": manifest_digest,
         "output_path": str(output_path),
         "result_path": str(result_path),
+        "session_gid": session_gid,
+        "session_uid": session_uid,
+        "snapshot_digest": snapshot_digest,
+        "snapshot_path": str(snapshot_path),
     }
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
-
-
-def _engine_digest() -> str:
-    module_root = Path(__file__).resolve(strict=True).parents[2]
-    digest = hashlib.sha256()
-    for name in _ENGINE_FILES:
-        digest.update(name.encode())
-        digest.update((module_root / name).read_bytes())
-    return digest.hexdigest()
 
 
 def _manifest_digest(session: Session) -> str:
@@ -577,26 +529,41 @@ def _admin_bindings(session: Session) -> dict[str, Mapping[str, object]]:
 def _validate_binding(binding: Mapping[str, object]) -> None:
     keys = {
         "allowed_root",
+        "batch",
         "batch_id",
         "checksum",
-        "engine_digest",
         "manifest_digest",
         "operation_digest",
         "output_path",
         "result_path",
+        "session_gid",
+        "session_uid",
+        "snapshot_digest",
+        "snapshot_path",
         "target_ids",
     }
     if set(binding) != keys:
         raise ValueError("administrative binding fields do not match schema")
-    for key in keys - {"target_ids"}:
+    text_keys = keys - {"batch", "session_gid", "session_uid", "target_ids"}
+    for key in text_keys:
         if not isinstance(binding[key], str):
             raise ValueError("administrative binding text field is invalid")
+    if not isinstance(binding["batch"], Mapping):
+        raise ValueError("administrative binding batch is invalid")
+    for key in ("session_gid", "session_uid"):
+        if type(binding[key]) is not int or binding[key] < 0:
+            raise ValueError("administrative binding owner is invalid")
     target_ids = binding["target_ids"]
     if not isinstance(target_ids, list) or not all(
         isinstance(target_id, str) for target_id in target_ids
     ):
         raise ValueError("administrative binding target ids are invalid")
-    for key in ("checksum", "engine_digest", "manifest_digest", "operation_digest"):
+    for key in (
+        "checksum",
+        "manifest_digest",
+        "operation_digest",
+        "snapshot_digest",
+    ):
         if not _SHA256.fullmatch(binding[key]):
             raise ValueError("administrative binding digest is invalid")
 
@@ -642,10 +609,18 @@ def _validate_result_binding(
     return validated
 
 
-def _require_regular_file(path: Path, label: str) -> None:
+def _require_owned_regular_file(
+    path: Path, label: str, owner_uid: int, owner_gid: int, mode: int
+) -> None:
     path_stat = path.lstat()
-    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
-        raise ValueError(f"{label} must be a regular non-symlink file")
+    if (
+        stat.S_ISLNK(path_stat.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or path_stat.st_uid != owner_uid
+        or path_stat.st_gid != owner_gid
+        or stat.S_IMODE(path_stat.st_mode) != mode
+    ):
+        raise ValueError(f"{label} owner, mode, or type is unsafe")
 
 
 def _suspend_missing_result_file(
@@ -666,25 +641,40 @@ def _suspend_missing_result_file(
         session.transition_batch(mutable, "suspended")
 
 
-def _atomic_write_script(path: Path, payload: bytes) -> None:
+def _atomic_write_bytes_owned(
+    path: Path, payload: bytes, owner_uid: int, owner_gid: int, mode: int
+) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(descriptor, 0o700)
+        if os.geteuid() == 0:
+            os.fchown(descriptor, owner_uid, owner_gid)
+        os.fchmod(descriptor, mode)
+        current = os.fstat(descriptor)
+        if (
+            current.st_uid != owner_uid
+            or current.st_gid != owner_gid
+            or stat.S_IMODE(current.st_mode) != mode
+        ):
+            raise ValueError("administrative artifact owner or mode is unsafe")
         with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        os.chmod(path, 0o700)
+        final = path.lstat()
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_uid != owner_uid
+            or final.st_gid != owner_gid
+            or stat.S_IMODE(final.st_mode) != mode
+        ):
+            raise ValueError("published administrative artifact is unsafe")
     except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
         raise
-
-
-def _issue_exit_code(issues: Sequence[Issue]) -> int:
-    if any(issue.severity is Severity.CRITICAL for issue in issues):
-        return 4
-    return 3
