@@ -1,3 +1,4 @@
+import fcntl
 import multiprocessing
 import os
 import signal
@@ -30,6 +31,32 @@ def _fork_inside_session_lock_and_exit(
                 os._exit(0)
         sender.send(("child", child_pid))  # type: ignore[attr-defined]
         os._exit(0)
+
+
+def _load_session_after_reporting_lock_attempt(
+    session_path: str, sender: object
+) -> None:
+    import scripts.mac_cleanup.sessions as sessions_module
+
+    real_flock = sessions_module.fcntl.flock
+    reported = False
+
+    def observed_flock(descriptor: int, operation: int) -> None:
+        nonlocal reported
+        if operation == fcntl.LOCK_EX and not reported:
+            reported = True
+            sender.send(("waiting", os.fstat(descriptor).st_ino))  # type: ignore[attr-defined]
+        real_flock(descriptor, operation)
+
+    sessions_module.fcntl.flock = observed_flock
+    try:
+        Session.load(session_path)
+        current_inode = os.stat(Path(session_path) / ".session.lock").st_ino
+        sender.send(("acquired", current_inode))  # type: ignore[attr-defined]
+    except BaseException as error:
+        sender.send(("error", repr(error)))  # type: ignore[attr-defined]
+    finally:
+        sender.close()  # type: ignore[attr-defined]
 
 
 class SessionTest(unittest.TestCase):
@@ -166,6 +193,61 @@ class SessionTest(unittest.TestCase):
                     os.kill(child_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def test_waiter_retries_current_lock_inode_after_path_replacement(self) -> None:
+        Session.create(self.session_path)
+        lock_path = self.session_path / ".session.lock"
+        old_descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        fcntl.flock(old_descriptor, fcntl.LOCK_EX)
+        context = multiprocessing.get_context("fork")
+        receiver, sender = context.Pipe(duplex=False)
+        waiter = context.Process(
+            target=_load_session_after_reporting_lock_attempt,
+            args=(str(self.session_path), sender),
+        )
+        new_descriptor = -1
+
+        waiter.start()
+        sender.close()
+        try:
+            self.assertTrue(receiver.poll(2), "waiter never opened the old lock")
+            waiting = receiver.recv()
+            self.assertEqual(waiting[0], "waiting", waiting)
+            replacement = self.session_path / ".replacement.lock"
+            replacement.write_bytes(b"")
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, lock_path)
+            new_descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+            fcntl.flock(new_descriptor, fcntl.LOCK_EX)
+            current_inode = os.fstat(new_descriptor).st_ino
+
+            fcntl.flock(old_descriptor, fcntl.LOCK_UN)
+            os.close(old_descriptor)
+            old_descriptor = -1
+            self.assertFalse(
+                receiver.poll(0.3),
+                "waiter entered through the replaced stale lock inode",
+            )
+
+            fcntl.flock(new_descriptor, fcntl.LOCK_UN)
+            os.close(new_descriptor)
+            new_descriptor = -1
+            self.assertTrue(receiver.poll(2), "waiter did not retry the current lock")
+            acquired = receiver.recv()
+            self.assertEqual(acquired, ("acquired", current_inode))
+            waiter.join(timeout=2)
+            self.assertEqual(waiter.exitcode, 0)
+        finally:
+            receiver.close()
+            if old_descriptor >= 0:
+                fcntl.flock(old_descriptor, fcntl.LOCK_UN)
+                os.close(old_descriptor)
+            if new_descriptor >= 0:
+                fcntl.flock(new_descriptor, fcntl.LOCK_UN)
+                os.close(new_descriptor)
+            if waiter.is_alive():
+                waiter.kill()
+                waiter.join(timeout=2)
 
     def test_reload_resumes_once_without_inferring_missing_state_as_success(self) -> None:
         session = Session.create(self.session_path)

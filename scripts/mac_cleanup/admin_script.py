@@ -27,26 +27,156 @@ _SUPPORTED_BATCH_RISKS = {
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _VERIFIER_BYTES = Path(__file__).with_name("admin_verifier.py").read_bytes()
 _VERIFIER_SOURCE = _VERIFIER_BYTES.decode("utf-8")
-_BOOTSTRAP = (
-    "import hashlib,hmac,os,stat,sys;"
-    "f=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW);"
-    "a=os.fstat(f);"
-    "a.st_size<=16777216 or sys.exit(65);"
-    "b=os.read(f,a.st_size+1);"
-    "z=os.fstat(f);"
-    "os.close(f);"
-    "stat.S_ISREG(a.st_mode)or sys.exit(65);"
-    "stat.S_IMODE(a.st_mode)==0o600 or sys.exit(65);"
-    "(a.st_uid,a.st_gid)==(int(sys.argv[12]),int(sys.argv[13]))or sys.exit(65);"
-    "(a.st_dev,a.st_ino,a.st_size,a.st_mtime_ns)=="
-    "(z.st_dev,z.st_ino,z.st_size,z.st_mtime_ns)or sys.exit(65);"
-    "len(b)==a.st_size or sys.exit(65);"
-    "hmac.compare_digest(hashlib.sha256(b).hexdigest(),sys.argv[2])or sys.exit(65);"
-    "p=sys.argv[1];"
-    "sys.argv=[p]+sys.argv[3:];"
-    "g={'__name__':'__main__','__file__':p};"
-    "exec(compile(b,p,'exec'),g,g)"
-)
+_BOOTSTRAP_SOURCE = r'''import fcntl,hashlib,hmac,json,os,stat,sys
+LIMIT=16777216
+KEYS={"allowed_root","batch","batch_id","checksum","manifest_digest","operation_digest","output_path","result_path","session_gid","session_path","session_uid","snapshot_digest","snapshot_path","target_ids"}
+def fail(message):
+    raise RuntimeError(message)
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+def canonical(value):
+    return json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+def sha(value):
+    return isinstance(value,str) and len(value)==64 and all(c in "0123456789abcdef" for c in value)
+def same(first,second):
+    return (first.st_dev,first.st_ino,stat.S_IFMT(first.st_mode),first.st_uid,first.st_gid,first.st_mtime_ns,first.st_size)==(second.st_dev,second.st_ino,stat.S_IFMT(second.st_mode),second.st_uid,second.st_gid,second.st_mtime_ns,second.st_size)
+def absolute_directory(path):
+    if not isinstance(path,str) or not os.path.isabs(path) or os.path.normpath(path)!=path or "\0" in path:
+        fail("session path is not canonical")
+    fd=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        for part in path.split("/")[1:]:
+            if part:
+                child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+                os.close(fd)
+                fd=child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+def artifact_name(path,session,label):
+    if not isinstance(path,str) or not os.path.isabs(path) or os.path.normpath(path)!=path or os.path.dirname(path)!=session or os.path.basename(path) in {"",".",".."} or "\0" in path:
+        fail(label+" path is outside session")
+    return os.path.basename(path)
+def read_regular_at(directory,name,label,uid,gid,mode):
+    fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid!=uid or before.st_gid!=gid or stat.S_IMODE(before.st_mode)!=mode or before.st_size>LIMIT:
+            fail(label+" metadata is unsafe")
+        chunks=[]
+        remaining=before.st_size
+        while remaining:
+            chunk=os.read(fd,min(remaining,1048576))
+            if not chunk:
+                fail(label+" was truncated")
+            chunks.append(chunk)
+            remaining-=len(chunk)
+        if os.read(fd,1) or not same(before,os.fstat(fd)):
+            fail(label+" changed while reading")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+def current_lock(directory,fd):
+    try:
+        named=os.stat(".session.lock",dir_fd=directory,follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    locked=os.fstat(fd)
+    return (named.st_dev,named.st_ino)==(locked.st_dev,locked.st_ino)
+def stable_lock(directory,uid,gid):
+    for unused in range(8):
+        fd=os.open(".session.lock",os.O_RDWR|os.O_NOFOLLOW,dir_fd=directory)
+        try:
+            value=os.fstat(fd)
+            if not stat.S_ISREG(value.st_mode) or value.st_uid!=uid or value.st_gid!=gid or stat.S_IMODE(value.st_mode)!=0o600:
+                fail("session lock metadata is unsafe")
+            fcntl.flock(fd,fcntl.LOCK_EX)
+            if current_lock(directory,fd):
+                return fd
+            fcntl.flock(fd,fcntl.LOCK_UN)
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+    fail("session lock pathname did not stabilize")
+if len(sys.argv)!=4:
+    sys.exit(64)
+session_path,batch_id,target_id=sys.argv[1:]
+session_fd=absolute_directory(session_path)
+lock_fd=-1
+try:
+    session_stat=os.fstat(session_fd)
+    if not stat.S_ISDIR(session_stat.st_mode) or stat.S_IMODE(session_stat.st_mode)!=0o700:
+        fail("session directory metadata is unsafe")
+    uid,gid=session_stat.st_uid,session_stat.st_gid
+    lock_fd=stable_lock(session_fd,uid,gid)
+    try:
+        state=json.loads(read_regular_at(session_fd,"state.json","state",uid,gid,0o600).decode("utf-8"))
+    except (UnicodeDecodeError,json.JSONDecodeError):
+        fail("state is not JSON")
+    if not isinstance(state,dict) or set(state)!={"schema_version","created_at","admin_scripts","critical_stop","events","issues","manifest","targets"} or state.get("schema_version")!=1:
+        fail("state schema is invalid")
+    if not isinstance(state.get("created_at"),str) or not isinstance(state.get("events"),list) or not isinstance(state.get("issues"),list):
+        fail("state fields are invalid")
+    if state.get("critical_stop") is not None or not isinstance(state.get("targets"),dict) or state["targets"].get(target_id)!="approved":
+        fail("target is not currently approved")
+    if any(not isinstance(key,str) or value not in {"pending","approved","applied","verified","suspended","skipped","failed"} for key,value in state["targets"].items()):
+        fail("target states are invalid")
+    scripts=state.get("admin_scripts")
+    binding=scripts.get(batch_id) if isinstance(scripts,dict) else None
+    if not isinstance(binding,dict) or set(binding)!=KEYS:
+        fail("administrative binding schema is invalid")
+    text_keys=KEYS-{"batch","session_gid","session_uid","target_ids"}
+    if any(not isinstance(binding[key],str) for key in text_keys) or not isinstance(binding["batch"],dict) or type(binding["session_uid"]) is not int or type(binding["session_gid"]) is not int or not isinstance(binding["target_ids"],list) or not all(isinstance(item,str) for item in binding["target_ids"]):
+        fail("administrative binding fields are invalid")
+    if binding["batch_id"]!=batch_id or binding["session_path"]!=session_path or binding["session_uid"]!=uid or binding["session_gid"]!=gid:
+        fail("administrative session binding changed")
+    for key in ("checksum","manifest_digest","operation_digest","snapshot_digest"):
+        if not sha(binding.get(key)):
+            fail("administrative digest is invalid")
+    output_name=artifact_name(binding["output_path"],session_path,"script")
+    result_name=artifact_name(binding["result_path"],session_path,"result")
+    snapshot_name=artifact_name(binding["snapshot_path"],session_path,"snapshot")
+    if len({output_name,result_name,snapshot_name})!=3:
+        fail("administrative artifacts overlap")
+    manifest=state.get("manifest")
+    if not isinstance(manifest,dict) or set(manifest)!={"digest","target_ids","value"} or not isinstance(manifest.get("value"),dict) or not isinstance(manifest.get("target_ids"),list) or not all(isinstance(item,str) for item in manifest["target_ids"]) or manifest["target_ids"]!=sorted(manifest["target_ids"]) or not sha(manifest.get("digest")) or manifest["digest"]!=binding["manifest_digest"] or not hmac.compare_digest(digest(canonical(manifest["value"])),manifest["digest"]):
+        fail("manifest binding is invalid")
+    batches=manifest["value"].get("batches")
+    matches=[item for item in batches if isinstance(item,dict) and item.get("id")==batch_id] if isinstance(batches,list) else []
+    if len(matches)!=1 or matches[0]!=binding.get("batch"):
+        fail("batch binding changed")
+    members=matches[0].get("targets")
+    target_matches=[item for item in members if isinstance(item,dict) and item.get("id")==target_id] if isinstance(members,list) else []
+    target_ids=[item.get("id") for item in members if isinstance(item,dict)] if isinstance(members,list) else []
+    if len(target_matches)!=1 or binding.get("target_ids")!=target_ids or len(target_ids)!=len(set(target_ids)):
+        fail("target binding changed")
+    discovered=[item.get("id") for batch in batches if isinstance(batch,dict) and isinstance(batch.get("targets"),list) for item in batch["targets"] if isinstance(item,dict)]
+    if sorted(discovered)!=manifest["target_ids"] or len(discovered)!=len(set(discovered)) or set(state["targets"])!=set(manifest["target_ids"]):
+        fail("manifest target identities changed")
+    operation={key:binding[key] for key in ("allowed_root","batch","checksum","manifest_digest","output_path","result_path","session_gid","session_path","session_uid","snapshot_digest","snapshot_path")}
+    if not hmac.compare_digest(digest(canonical(operation)),binding["operation_digest"]):
+        fail("operation binding changed")
+    script_bytes=read_regular_at(session_fd,output_name,"script",uid,gid,0o700)
+    if not hmac.compare_digest(digest(script_bytes),binding["checksum"]):
+        fail("script checksum changed")
+    snapshot_bytes=read_regular_at(session_fd,snapshot_name,"snapshot",uid,gid,0o600)
+    if not hmac.compare_digest(digest(snapshot_bytes),binding["snapshot_digest"]):
+        fail("snapshot digest changed")
+    snapshot_path=binding["snapshot_path"]
+    target=target_matches[0]
+    verifier_arguments=[session_path,snapshot_path,binding["snapshot_digest"],binding["output_path"],binding["result_path"],binding["operation_digest"],batch_id,canonical(target).decode("utf-8"),binding["allowed_root"],str(uid),str(gid),binding["manifest_digest"],target_id,target["path"],target["fingerprint"]]
+finally:
+    if lock_fd>=0:
+        fcntl.flock(lock_fd,fcntl.LOCK_UN)
+        os.close(lock_fd)
+    os.close(session_fd)
+sys.argv=[snapshot_path]+verifier_arguments
+namespace={"__name__":"__main__","__file__":snapshot_path}
+exec(compile(snapshot_bytes,snapshot_path,"exec"),namespace,namespace)
+'''
+_BOOTSTRAP = "exec(compile(" + repr(_BOOTSTRAP_SOURCE) + ",'<admin-bootstrap>','exec'))"
 
 
 def quote_zsh_literal(value: str) -> str:
@@ -97,9 +227,14 @@ def generate_admin_script(
         session_uid = session_stat.st_uid
         session_gid = session_stat.st_gid
         snapshot_digest = hashlib.sha256(_VERIFIER_BYTES).hexdigest()
+        script = _render_script(persisted, session.path)
+        payload = script.encode("utf-8")
+        checksum = hashlib.sha256(payload).hexdigest()
         operation_digest = _operation_digest(
             persisted,
+            checksum,
             manifest_digest,
+            session.path,
             output,
             result,
             snapshot,
@@ -115,21 +250,6 @@ def generate_admin_script(
             "target_ids": [target.id for target in persisted.targets],
             "targets": {},
         }
-        script = _render_script(
-            persisted,
-            session.path,
-            output,
-            result,
-            snapshot,
-            snapshot_digest,
-            operation_digest,
-            manifest_digest,
-            allowed_root,
-            session_uid,
-            session_gid,
-        )
-        payload = script.encode("utf-8")
-        checksum = hashlib.sha256(payload).hexdigest()
         binding = {
             "allowed_root": str(allowed_root),
             "batch": persisted.to_dict(),
@@ -139,6 +259,7 @@ def generate_admin_script(
             "operation_digest": operation_digest,
             "output_path": str(output),
             "result_path": str(result),
+            "session_path": str(session.path),
             "session_gid": session_gid,
             "session_uid": session_uid,
             "snapshot_digest": snapshot_digest,
@@ -202,6 +323,8 @@ def import_admin_results(
             raise ValueError("result path has no unique administrative binding")
         binding = matches[0]
         _validate_binding(binding)
+        if binding["session_path"] != str(session.path):
+            raise ValueError("administrative binding targets a different session")
         if not hmac.compare_digest(binding["checksum"], expected_checksum):
             raise ValueError("administrative checksum differs from durable state")
         script_path = Path(binding["output_path"])
@@ -232,7 +355,9 @@ def import_admin_results(
         manifest_digest = _manifest_digest(session)
         expected_operation = _operation_digest(
             persisted,
+            binding["checksum"],
             manifest_digest,
+            session.path,
             script_path,
             result,
             snapshot_path,
@@ -274,43 +399,19 @@ def import_admin_results(
 def _render_script(
     batch: Batch,
     session_path: Path,
-    output_path: Path,
-    result_path: Path,
-    snapshot_path: Path,
-    snapshot_digest: str,
-    operation_digest: str,
-    manifest_digest: str,
-    allowed_root: Path,
-    session_uid: int,
-    session_gid: int,
 ) -> str:
     executable = str(Path(sys.executable).resolve(strict=True))
     lines = ["#!/bin/zsh", "set -eu"]
     for target in batch.targets:
-        target_json = canonical_bytes(target.to_dict()).decode("utf-8")
         arguments = (
             executable,
             "-I",
             "-S",
             "-c",
             _BOOTSTRAP,
-            str(snapshot_path),
-            snapshot_digest,
             str(session_path),
-            str(snapshot_path),
-            snapshot_digest,
-            str(output_path),
-            str(result_path),
-            operation_digest,
             batch.id,
-            target_json,
-            str(allowed_root),
-            str(session_uid),
-            str(session_gid),
-            manifest_digest,
             target.id,
-            target.path,
-            target.fingerprint,
         )
         lines.append(" ".join(quote_zsh_literal(argument) for argument in arguments))
     return "\n".join(lines) + "\n"
@@ -479,7 +580,9 @@ def _session_artifact_path(
 
 def _operation_digest(
     batch: Batch,
+    script_checksum: str,
     manifest_digest: str,
+    session_path: Path,
     output_path: Path,
     result_path: Path,
     snapshot_path: Path,
@@ -491,9 +594,11 @@ def _operation_digest(
     value = {
         "allowed_root": str(allowed_root),
         "batch": batch.to_dict(),
+        "checksum": script_checksum,
         "manifest_digest": manifest_digest,
         "output_path": str(output_path),
         "result_path": str(result_path),
+        "session_path": str(session_path),
         "session_gid": session_gid,
         "session_uid": session_uid,
         "snapshot_digest": snapshot_digest,
@@ -536,6 +641,7 @@ def _validate_binding(binding: Mapping[str, object]) -> None:
         "operation_digest",
         "output_path",
         "result_path",
+        "session_path",
         "session_gid",
         "session_uid",
         "snapshot_digest",

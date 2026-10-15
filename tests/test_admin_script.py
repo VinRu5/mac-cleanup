@@ -1,4 +1,7 @@
+import fcntl
+import hashlib
 import json
+import multiprocessing
 import os
 import subprocess
 import tempfile
@@ -17,6 +20,42 @@ from scripts.mac_cleanup.executor import apply_batch
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Target
 from scripts.mac_cleanup.paths import inspect_path
 from scripts.mac_cleanup.sessions import Session
+
+
+def _acquire_verifier_lock_after_reporting_attempt(
+    session_path: str, sender: object
+) -> None:
+    import scripts.mac_cleanup.admin_verifier as verifier
+
+    real_flock = verifier.fcntl.flock
+    reported = False
+
+    def observed_flock(descriptor: int, operation: int) -> None:
+        nonlocal reported
+        if operation == fcntl.LOCK_EX and not reported:
+            reported = True
+            sender.send(("waiting", os.fstat(descriptor).st_ino))  # type: ignore[attr-defined]
+        real_flock(descriptor, operation)
+
+    verifier.fcntl.flock = observed_flock
+    session_fd = -1
+    lock_fd = -1
+    try:
+        session_fd = verifier._absolute_directory(session_path, "session")
+        owner = os.fstat(session_fd)
+        lock_fd = verifier._acquire_stable_lock(
+            session_fd, owner.st_uid, owner.st_gid
+        )
+        sender.send(("acquired", os.fstat(lock_fd).st_ino))  # type: ignore[attr-defined]
+    except BaseException as error:
+        sender.send(("error", repr(error)))  # type: ignore[attr-defined]
+    finally:
+        if lock_fd >= 0:
+            real_flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        if session_fd >= 0:
+            os.close(session_fd)
+        sender.close()  # type: ignore[attr-defined]
 
 
 class AdminScriptTest(unittest.TestCase):
@@ -95,7 +134,7 @@ class AdminScriptTest(unittest.TestCase):
         self.assertEqual(checksum, repeated)
         self.assertEqual(first, script_path.read_text(encoding="utf-8"))
         self.assertTrue(first.startswith("#!/bin/zsh\nset -eu\n"))
-        self.assertIn(quote_zsh_literal(target.path), first)
+        self.assertNotIn(quote_zsh_literal(target.path), first)
         for forbidden in (
             "$HOME",
             "${HOME}",
@@ -577,6 +616,40 @@ class AdminScriptTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertTrue(Path(target.path).exists())
 
+    def test_coordinated_script_and_snapshot_tamper_cannot_bypass_durable_binding(
+        self,
+    ) -> None:
+        target = self._target("coordinated-tamper")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _, script_path, _ = self._generate(batch)
+        binding = self.session.state["admin_scripts"][batch.id]
+        snapshot = Path(binding["snapshot_path"])
+        marker = self.root / "malicious-marker"
+        malicious = (
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        ).encode("utf-8")
+        snapshot.write_bytes(malicious)
+        os.chmod(snapshot, 0o600)
+        malicious_digest = hashlib.sha256(malicious).hexdigest()
+        script_text = script_path.read_text(encoding="utf-8")
+        script_path.write_text(
+            script_text.replace(binding["snapshot_digest"], malicious_digest)
+            + "# coordinated script tamper\n",
+            encoding="utf-8",
+        )
+        os.chmod(script_path, 0o700)
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(marker.exists())
+        self.assertTrue(Path(target.path).exists())
+        self.assertEqual(self.session.status(target.id), "approved")
+
     def test_snapshot_is_self_contained_and_result_preserves_session_owner(self) -> None:
         target = self._target("owned")
         batch = Batch("safe-user-caches", (target,))
@@ -598,11 +671,88 @@ class AdminScriptTest(unittest.TestCase):
         self.assertEqual(result_stat.st_mode & 0o777, 0o600)
 
     def test_bootstrap_executes_only_the_once_read_verified_snapshot_bytes(self) -> None:
-        self.assertEqual(_BOOTSTRAP.count("os.open(sys.argv[1]"), 1)
-        self.assertEqual(_BOOTSTRAP.count("os.read(f"), 1)
-        self.assertIn("hashlib.sha256(b)", _BOOTSTRAP)
-        self.assertIn("exec(compile(b,p", _BOOTSTRAP)
+        self.assertIn("state.json", _BOOTSTRAP)
+        self.assertIn('binding["checksum"]', _BOOTSTRAP)
+        self.assertIn('binding["snapshot_digest"]', _BOOTSTRAP)
+        self.assertIn("snapshot_bytes=read_regular_at", _BOOTSTRAP)
+        self.assertIn("exec(compile(snapshot_bytes", _BOOTSTRAP)
+        self.assertLess(
+            _BOOTSTRAP.index("state.json"),
+            _BOOTSTRAP.index('binding["checksum"]'),
+        )
+        self.assertLess(
+            _BOOTSTRAP.index('binding["checksum"]'),
+            _BOOTSTRAP.index("snapshot_bytes=read_regular_at"),
+        )
+        self.assertLess(
+            _BOOTSTRAP.index("snapshot_bytes=read_regular_at"),
+            _BOOTSTRAP.index("exec(compile(snapshot_bytes"),
+        )
         self.assertNotIn("read_bytes", _BOOTSTRAP)
+
+    def test_generated_script_does_not_embed_durable_artifact_digests(self) -> None:
+        target = self._target("durable-only")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        checksum, script_path, _ = self._generate(batch)
+        binding = self.session.state["admin_scripts"][batch.id]
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertNotIn(checksum, script)
+        self.assertNotIn(binding["snapshot_digest"], script)
+        self.assertNotIn(binding["snapshot_path"], script)
+
+    def test_verifier_waiter_retries_current_lock_inode_after_replacement(self) -> None:
+        lock_path = self.session.path / ".session.lock"
+        old_descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        fcntl.flock(old_descriptor, fcntl.LOCK_EX)
+        context = multiprocessing.get_context("fork")
+        receiver, sender = context.Pipe(duplex=False)
+        waiter = context.Process(
+            target=_acquire_verifier_lock_after_reporting_attempt,
+            args=(str(self.session.path), sender),
+        )
+        new_descriptor = -1
+
+        waiter.start()
+        sender.close()
+        try:
+            self.assertTrue(receiver.poll(2), "verifier never opened the old lock")
+            self.assertEqual(receiver.recv()[0], "waiting")
+            replacement = self.session.path / ".replacement.lock"
+            replacement.write_bytes(b"")
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, lock_path)
+            new_descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+            fcntl.flock(new_descriptor, fcntl.LOCK_EX)
+            current_inode = os.fstat(new_descriptor).st_ino
+
+            fcntl.flock(old_descriptor, fcntl.LOCK_UN)
+            os.close(old_descriptor)
+            old_descriptor = -1
+            self.assertFalse(
+                receiver.poll(0.3),
+                "verifier entered through the replaced stale lock inode",
+            )
+
+            fcntl.flock(new_descriptor, fcntl.LOCK_UN)
+            os.close(new_descriptor)
+            new_descriptor = -1
+            self.assertTrue(receiver.poll(2), "verifier did not retry current lock")
+            self.assertEqual(receiver.recv(), ("acquired", current_inode))
+            waiter.join(timeout=2)
+            self.assertEqual(waiter.exitcode, 0)
+        finally:
+            receiver.close()
+            if old_descriptor >= 0:
+                fcntl.flock(old_descriptor, fcntl.LOCK_UN)
+                os.close(old_descriptor)
+            if new_descriptor >= 0:
+                fcntl.flock(new_descriptor, fcntl.LOCK_UN)
+                os.close(new_descriptor)
+            if waiter.is_alive():
+                waiter.kill()
+                waiter.join(timeout=2)
 
     def test_snapshot_privileged_writer_fchowns_temp_to_bound_owner(self) -> None:
         namespace = {"__name__": "verifier_test"}

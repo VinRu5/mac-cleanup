@@ -140,6 +140,7 @@ def _apply_batch_locked(
 
         assert result.identity is not None
         try:
+            session.assert_operation_lock_current()
             removed += remove_tree_exact(result.identity, roots)
         except PathSafetyError as error:
             runtime_issues.append(_issue_from_safety_error(result.target, error))

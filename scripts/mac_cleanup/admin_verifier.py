@@ -19,6 +19,7 @@ import sys
 
 RESULT_SCHEMA_VERSION = 1
 _READ_LIMIT = 16 * 1024 * 1024
+_LOCK_ACQUIRE_ATTEMPTS = 8
 _SUPPORTED_RISKS = {
     "safe-user-caches": "safe_regenerable",
     "review-user-caches": "review_required",
@@ -179,6 +180,47 @@ def _read_json_at(
     return value
 
 
+def _require_current_lock(session_fd: int, lock_fd: int) -> None:
+    try:
+        current = os.stat(
+            ".session.lock", dir_fd=session_fd, follow_symlinks=False
+        )
+    except FileNotFoundError as error:
+        raise SafetyError("session lock pathname disappeared", critical=True) from error
+    locked = os.fstat(lock_fd)
+    if (current.st_dev, current.st_ino) != (locked.st_dev, locked.st_ino):
+        raise SafetyError("session lock pathname was replaced", critical=True)
+
+
+def _acquire_stable_lock(session_fd: int, uid: int, gid: int) -> int:
+    """Acquire the inode currently named by the session lock pathname."""
+    for _ in range(_LOCK_ACQUIRE_ATTEMPTS):
+        descriptor = os.open(
+            ".session.lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=session_fd
+        )
+        try:
+            lock_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(lock_stat.st_mode)
+                or lock_stat.st_uid != uid
+                or lock_stat.st_gid != gid
+                or stat.S_IMODE(lock_stat.st_mode) != 0o600
+            ):
+                raise SafetyError("session lock changed", critical=True)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                _require_current_lock(session_fd, descriptor)
+            except SafetyError:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            else:
+                return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+        os.close(descriptor)
+    raise SafetyError("session lock pathname did not stabilize", critical=True)
+
+
 def _owned_temp(
     directory_fd: int, destination_name: str, uid: int, gid: int, mode: int
 ) -> tuple[int, str]:
@@ -319,9 +361,11 @@ def _operation_digest(binding: dict[str, object]) -> str:
     value = {
         "allowed_root": binding["allowed_root"],
         "batch": binding["batch"],
+        "checksum": binding["checksum"],
         "manifest_digest": binding["manifest_digest"],
         "output_path": binding["output_path"],
         "result_path": binding["result_path"],
+        "session_path": binding["session_path"],
         "session_gid": binding["session_gid"],
         "session_uid": binding["session_uid"],
         "snapshot_digest": binding["snapshot_digest"],
@@ -357,6 +401,7 @@ def _validate_binding(
         "operation_digest",
         "output_path",
         "result_path",
+        "session_path",
         "session_gid",
         "session_uid",
         "snapshot_digest",
@@ -372,6 +417,7 @@ def _validate_binding(
         "operation_digest": operation_digest,
         "output_path": script_path,
         "result_path": result_path,
+        "session_path": os.path.dirname(result_path),
         "session_gid": session_gid,
         "session_uid": session_uid,
         "snapshot_digest": snapshot_digest,
@@ -674,6 +720,7 @@ def _issue(
 
 def _checkpoint(
     session_fd: int,
+    lock_fd: int,
     result_name: str,
     results: dict[str, object],
     target_id: str,
@@ -683,6 +730,7 @@ def _checkpoint(
     uid: int,
     gid: int,
 ) -> None:
+    _require_current_lock(session_fd, lock_fd)
     next_value = json.loads(_canonical_bytes(results).decode("utf-8"))
     targets = next_value["targets"]
     assert isinstance(targets, dict)
@@ -751,18 +799,7 @@ def _run(arguments: tuple[str, ...]) -> int:
         result_name = _artifact_name(result_path, session_path, "result")
         if len({snapshot_name, script_name, result_name}) != 3:
             raise SafetyError("administrative artifacts overlap", critical=True)
-        lock_fd = os.open(
-            ".session.lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=session_fd
-        )
-        lock_stat = os.fstat(lock_fd)
-        if (
-            not stat.S_ISREG(lock_stat.st_mode)
-            or lock_stat.st_uid != uid
-            or lock_stat.st_gid != gid
-            or stat.S_IMODE(lock_stat.st_mode) != 0o600
-        ):
-            raise SafetyError("session lock changed", critical=True)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lock_fd = _acquire_stable_lock(session_fd, uid, gid)
 
         # Reload durable authorization only after acquiring the stable session lock.
         state = _read_json_at(
@@ -842,6 +879,7 @@ def _run(arguments: tuple[str, ...]) -> int:
             ]
             _checkpoint(
                 session_fd,
+                lock_fd,
                 result_name,
                 results,
                 str(target["id"]),
@@ -853,6 +891,49 @@ def _run(arguments: tuple[str, ...]) -> int:
             )
             return 0
         target_fd, _target_stat, target_kind, removed = inspected
+        # A replacement after acquisition would split direct and administrative
+        # operations across different inodes.  Recheck both durable authority and
+        # the named lock immediately before the first destructive syscall.
+        _require_current_lock(session_fd, lock_fd)
+        current_state = _read_json_at(
+            session_fd, "state.json", "state", owner=uid, group=gid, mode=0o600
+        )
+        current_manifest = _validate_manifest_record(current_state)
+        current_binding = _validate_binding(
+            current_state,
+            current_manifest,
+            batch_id,
+            operation_digest,
+            snapshot_path,
+            snapshot_digest,
+            script_path,
+            result_path,
+            allowed_root,
+            uid,
+            gid,
+            target,
+        )
+        if not hmac.compare_digest(
+            str(current_binding["checksum"]), str(binding["checksum"])
+        ):
+            raise SafetyError(
+                "administrative checksum binding changed", critical=True
+            )
+        current_script = _read_regular_at(
+            session_fd,
+            script_name,
+            "script",
+            owner=uid,
+            group=gid,
+            mode=0o700,
+        )
+        if not hmac.compare_digest(
+            _sha256(current_script), str(current_binding["checksum"])
+        ):
+            raise SafetyError(
+                "administrative script checksum changed", critical=True
+            )
+        _require_current_lock(session_fd, lock_fd)
         if target_kind == "directory":
             _remove_directory_exact(root_fd, name, target_fd)
         else:
@@ -865,6 +946,7 @@ def _run(arguments: tuple[str, ...]) -> int:
             raise SafetyError("target remains after deletion")
         _checkpoint(
             session_fd,
+            lock_fd,
             result_name,
             results,
             str(target["id"]),
@@ -888,6 +970,7 @@ def _run(arguments: tuple[str, ...]) -> int:
             try:
                 _checkpoint(
                     session_fd,
+                    lock_fd,
                     result_name,
                     results,
                     str(target.get("id")),
@@ -917,6 +1000,7 @@ def _run(arguments: tuple[str, ...]) -> int:
             try:
                 _checkpoint(
                     session_fd,
+                    lock_fd,
                     result_name,
                     results,
                     str(target.get("id")),

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import threading
 from typing import Iterator, Mapping, Sequence
@@ -19,6 +20,7 @@ from .models import Issue, Manifest, Severity, TargetStatus
 
 
 SCHEMA_VERSION = 1
+_LOCK_ACQUIRE_ATTEMPTS = 8
 
 ALLOWED_TRANSITIONS = {
     "pending": {"approved", "skipped", "suspended"},
@@ -92,6 +94,43 @@ def _local_session_lock(path: Path) -> _LocalSessionLock:
             local = _LocalSessionLock()
             _LOCAL_LOCKS[key] = local
         return local
+
+
+def _same_lock_inode(path: Path, descriptor: int) -> bool:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    locked = os.fstat(descriptor)
+    return (current.st_dev, current.st_ino) == (locked.st_dev, locked.st_ino)
+
+
+def _acquire_stable_lock(path: Path) -> int:
+    """Lock the inode currently named by ``path``, retrying replacements."""
+    parent = path.parent.stat()
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for _ in range(_LOCK_ACQUIRE_ATTEMPTS):
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            locked = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(locked.st_mode)
+                or locked.st_uid != parent.st_uid
+                or locked.st_gid != parent.st_gid
+                or stat.S_IMODE(locked.st_mode) != 0o600
+            ):
+                raise SessionConsistencyError("session lock metadata is unsafe")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if _same_lock_inode(path, descriptor):
+                return descriptor
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        os.close(descriptor)
+    raise SessionConsistencyError("session lock pathname did not stabilize")
 
 
 if hasattr(os, "register_at_fork"):
@@ -178,13 +217,7 @@ class Session:
         outermost = local.depth == 0
         try:
             if outermost:
-                descriptor = os.open(
-                    self.lock_path,
-                    os.O_CREAT | os.O_RDWR,
-                    0o600,
-                )
-                os.fchmod(descriptor, 0o600)
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                descriptor = _acquire_stable_lock(self.lock_path)
                 local.file_descriptor = descriptor
             local.depth += 1
             self._reload_state_locked()
@@ -198,6 +231,16 @@ class Session:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
             local.gate.release()
+
+    def assert_operation_lock_current(self) -> None:
+        """Fail closed if this operation no longer owns the named lock inode."""
+        local = _local_session_lock(self.lock_path)
+        if (
+            local.depth <= 0
+            or local.file_descriptor is None
+            or not _same_lock_inode(self.lock_path, local.file_descriptor)
+        ):
+            raise SessionConsistencyError("session lock was replaced during operation")
 
     def write_inventory(self, inventory: Mapping[str, object]) -> None:
         atomic_write_json(self.inventory_path, _object(inventory, "inventory"))
@@ -414,6 +457,7 @@ class Session:
 
     def _persist_state(self, state: dict[str, object]) -> None:
         _validate_state(state)
+        self.assert_operation_lock_current()
         atomic_write_json(self.state_path, state)
         self._state = state
 
