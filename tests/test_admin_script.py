@@ -1,5 +1,4 @@
 import fcntl
-import hashlib
 import json
 import multiprocessing
 import os
@@ -15,6 +14,7 @@ from scripts.mac_cleanup.admin_script import (
     generate_admin_script,
     import_admin_results,
     quote_zsh_literal,
+    validate_admin_artifacts,
 )
 from scripts.mac_cleanup.executor import apply_batch
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Target
@@ -517,7 +517,7 @@ class AdminScriptTest(unittest.TestCase):
         script = script_path.read_text(encoding="utf-8")
         self.assertIn("'-I' '-S'", script)
 
-    def test_modified_script_fails_before_mutation(self) -> None:
+    def test_authentic_bootstrap_rejects_appended_script_tamper(self) -> None:
         target = self._target("script-tamper")
         batch = Batch("safe-user-caches", (target,))
         self._register(batch)
@@ -535,7 +535,7 @@ class AdminScriptTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertTrue(Path(target.path).exists())
 
-    def test_changed_durable_admin_checksum_fails_before_mutation(self) -> None:
+    def test_authentic_bootstrap_rejects_divergent_durable_checksum(self) -> None:
         target = self._target("binding-tamper")
         batch = Batch("safe-user-caches", (target,))
         self._register(batch)
@@ -597,7 +597,7 @@ class AdminScriptTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertTrue(Path(target.path).exists())
 
-    def test_verifier_snapshot_tamper_fails_before_mutation(self) -> None:
+    def test_authentic_script_rejects_snapshot_only_tamper(self) -> None:
         target = self._target("snapshot-tamper")
         batch = Batch("safe-user-caches", (target,))
         self._register(batch)
@@ -616,37 +616,69 @@ class AdminScriptTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertTrue(Path(target.path).exists())
 
-    def test_coordinated_script_and_snapshot_tamper_cannot_bypass_durable_binding(
-        self,
-    ) -> None:
-        target = self._target("coordinated-tamper")
+    def test_engine_validation_returns_exact_artifact_identity(self) -> None:
+        target = self._target("validated")
         batch = Batch("safe-user-caches", (target,))
         self._register(batch)
-        _, script_path, _ = self._generate(batch)
+        checksum, script_path, _ = self._generate(batch)
+        binding = self.session.state["admin_scripts"][batch.id]
+
+        validation = validate_admin_artifacts(
+            self.session, batch.id, trusted_home=self.home
+        )
+
+        self.assertEqual(validation.batch_id, batch.id)
+        self.assertEqual(validation.checksum, checksum)
+        self.assertEqual(validation.script_path, script_path)
+        self.assertEqual(validation.snapshot_path, Path(binding["snapshot_path"]))
+        self.assertEqual(validation.snapshot_digest, binding["snapshot_digest"])
+        self.assertEqual(validation.manifest_digest, binding["manifest_digest"])
+        self.assertTrue(Path(target.path).exists())
+
+    def test_generation_runs_engine_validation_after_publishing_artifacts(self) -> None:
+        target = self._target("generation-validation")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+
+        with patch(
+            "scripts.mac_cleanup.admin_script.validate_admin_artifacts",
+            wraps=validate_admin_artifacts,
+        ) as validator:
+            checksum, _, _ = self._generate(batch)
+
+        validator.assert_called_once()
+        called_session, called_batch_id = validator.call_args.args
+        self.assertEqual(called_session.path, self.session.path)
+        self.assertEqual(called_batch_id, batch.id)
+        self.assertEqual(validator.call_args.kwargs, {"trusted_home": self.home})
+        self.assertRegex(checksum, r"^[0-9a-f]{64}$")
+
+    def test_engine_validation_and_import_reject_wholesale_artifact_replacement(
+        self,
+    ) -> None:
+        target = self._target("wholesale-replacement")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        checksum, script_path, result_path = self._generate(batch)
         binding = self.session.state["admin_scripts"][batch.id]
         snapshot = Path(binding["snapshot_path"])
-        marker = self.root / "malicious-marker"
-        malicious = (
-            "from pathlib import Path\n"
-            f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
-        ).encode("utf-8")
-        snapshot.write_bytes(malicious)
-        os.chmod(snapshot, 0o600)
-        malicious_digest = hashlib.sha256(malicious).hexdigest()
-        script_text = script_path.read_text(encoding="utf-8")
-        script_path.write_text(
-            script_text.replace(binding["snapshot_digest"], malicious_digest)
-            + "# coordinated script tamper\n",
-            encoding="utf-8",
-        )
+        script_path.write_text("#!/bin/zsh\necho arbitrary-code\n", encoding="utf-8")
+        snapshot.write_text("raise SystemExit('arbitrary-code')\n", encoding="utf-8")
         os.chmod(script_path, 0o700)
+        os.chmod(snapshot, 0o600)
 
-        completed = subprocess.run(
-            (str(script_path),), capture_output=True, text=True, check=False
-        )
+        with self.assertRaises(ValueError):
+            validate_admin_artifacts(
+                self.session, batch.id, trusted_home=self.home
+            )
+        with self.assertRaises(ValueError):
+            import_admin_results(
+                self.session,
+                result_path,
+                checksum,
+                trusted_home=self.home,
+            )
 
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertFalse(marker.exists())
         self.assertTrue(Path(target.path).exists())
         self.assertEqual(self.session.status(target.id), "approved")
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import hmac
 import os
@@ -179,6 +180,20 @@ exec(compile(snapshot_bytes,snapshot_path,"exec"),namespace,namespace)
 _BOOTSTRAP = "exec(compile(" + repr(_BOOTSTRAP_SOURCE) + ",'<admin-bootstrap>','exec'))"
 
 
+@dataclass(frozen=True)
+class AdminArtifactValidation:
+    """Exact engine-validated identity a human must confirm before execution."""
+
+    batch_id: str
+    checksum: str
+    manifest_digest: str
+    operation_digest: str
+    script_path: Path
+    snapshot_digest: str
+    snapshot_path: Path
+    target_ids: tuple[str, ...]
+
+
 def quote_zsh_literal(value: str) -> str:
     """Return one static zsh single-quoted word without interpolation."""
     if not isinstance(value, str):
@@ -195,12 +210,15 @@ def generate_admin_script(
     *,
     trusted_home: Path | None = None,
 ) -> str:
-    """Generate and bind one static script for an approved session batch.
+    """Generate, bind, and engine-validate one static administrative script.
 
     The plan's three positional arguments are preserved.  The trusted session is
     deliberately derived from ``result_path.parent`` so a free-standing or forged
     batch cannot become executable.  ``trusted_home`` is a keyword-only fixture
-    seam; production derives the account home from the account database.
+    seam; production derives the account home from the account database.  The
+    returned checksum is the exact value the human must confirm before executing
+    the script.  Executing a different, wholly replaced shell program is arbitrary
+    local-code execution and is outside the cooperative local-user threat model.
     """
     if not isinstance(batch, Batch):
         raise TypeError("batch must be a Batch")
@@ -287,7 +305,131 @@ def generate_admin_script(
                 0o600,
             )
         session.bind_admin_script(persisted.id, binding)
-        return checksum
+        validation = validate_admin_artifacts(
+            session,
+            persisted.id,
+            trusted_home=trusted_home,
+        )
+        return validation.checksum
+
+
+def validate_admin_artifacts(
+    session: Session,
+    batch_id: str,
+    *,
+    trusted_home: Path | None = None,
+) -> AdminArtifactValidation:
+    """Validate the exact authorized artifacts immediately before manual use.
+
+    This read-only engine check holds the stable session lock while validating the
+    durable binding, current script and snapshot bytes, metadata, manifest, batch,
+    approvals, trusted root, and critical latch.  The caller must present and the
+    human must confirm ``checksum`` and execute that exact script.  This check does
+    not close the later manual-execution time gap against a malicious same-UID actor.
+    """
+    if not isinstance(session, Session):
+        raise TypeError("session must be a Session")
+    if not isinstance(batch_id, str) or not batch_id:
+        raise ValueError("administrative batch id must be non-empty text")
+    allowed_root = _trusted_cache_root(_trusted_home(trusted_home))
+
+    with session.operation_lock():
+        if session.critical_issue() is not None:
+            raise ValueError("session has a critical safety stop")
+        binding = session.admin_script_binding(batch_id)
+        if binding is None:
+            raise ValueError("administrative batch has no durable binding")
+        _validate_binding(binding)
+        if binding["batch_id"] != batch_id:
+            raise ValueError("administrative binding targets a different batch")
+        if binding["session_path"] != str(session.path):
+            raise ValueError("administrative binding targets a different session")
+
+        session_stat = session.path.stat()
+        if (
+            not stat.S_ISDIR(session_stat.st_mode)
+            or stat.S_IMODE(session_stat.st_mode) != 0o700
+            or session_stat.st_uid != binding["session_uid"]
+            or session_stat.st_gid != binding["session_gid"]
+        ):
+            raise ValueError("session owner or mode differs from its binding")
+        script_path = _bound_session_artifact(
+            session, binding["output_path"], "script"
+        )
+        result_path = _bound_session_artifact(
+            session, binding["result_path"], "result"
+        )
+        snapshot_path = _bound_session_artifact(
+            session, binding["snapshot_path"], "verifier snapshot"
+        )
+        if len({script_path, result_path, snapshot_path}) != 3:
+            raise ValueError("administrative artifacts must be distinct")
+
+        script_bytes = _read_owned_regular_bytes(
+            script_path,
+            "administrative script",
+            binding["session_uid"],
+            binding["session_gid"],
+            0o700,
+        )
+        actual_checksum = hashlib.sha256(script_bytes).hexdigest()
+        if not hmac.compare_digest(actual_checksum, binding["checksum"]):
+            raise ValueError("administrative script differs from durable checksum")
+        snapshot_bytes = _read_owned_regular_bytes(
+            snapshot_path,
+            "administrative verifier snapshot",
+            binding["session_uid"],
+            binding["session_gid"],
+            0o600,
+        )
+        actual_snapshot_digest = hashlib.sha256(snapshot_bytes).hexdigest()
+        if not hmac.compare_digest(
+            actual_snapshot_digest, binding["snapshot_digest"]
+        ):
+            raise ValueError("administrative verifier differs from durable binding")
+        _require_owned_regular_file(
+            result_path,
+            "administrative result",
+            binding["session_uid"],
+            binding["session_gid"],
+            0o600,
+        )
+
+        persisted = _approved_session_batch(session, _named_batch(session, batch_id))
+        _validate_batch_location(persisted, allowed_root)
+        manifest_digest = _manifest_digest(session)
+        expected_operation = _operation_digest(
+            persisted,
+            actual_checksum,
+            manifest_digest,
+            session.path,
+            script_path,
+            result_path,
+            snapshot_path,
+            actual_snapshot_digest,
+            allowed_root,
+            binding["session_uid"],
+            binding["session_gid"],
+        )
+        expected_ids = [target.id for target in persisted.targets]
+        if (
+            binding["manifest_digest"] != manifest_digest
+            or binding["allowed_root"] != str(allowed_root)
+            or binding["batch"] != persisted.to_dict()
+            or binding["target_ids"] != expected_ids
+            or binding["operation_digest"] != expected_operation
+        ):
+            raise ValueError("administrative binding is inconsistent")
+        return AdminArtifactValidation(
+            batch_id=batch_id,
+            checksum=actual_checksum,
+            manifest_digest=manifest_digest,
+            operation_digest=expected_operation,
+            script_path=script_path,
+            snapshot_digest=actual_snapshot_digest,
+            snapshot_path=snapshot_path,
+            target_ids=tuple(expected_ids),
+        )
 
 
 def import_admin_results(
@@ -297,7 +439,7 @@ def import_admin_results(
     *,
     trusted_home: Path | None = None,
 ) -> None:
-    """Import a bound result, independently verifying every claimed postcondition."""
+    """Post-validate artifacts/results and import verified filesystem outcomes."""
     if not isinstance(session, Session):
         raise TypeError("session must be a Session")
     if not isinstance(expected_checksum, str) or not _SHA256.fullmatch(
@@ -713,6 +855,71 @@ def _validate_result_binding(
                 raise ValueError("administrative target result issue is invalid")
         validated[target_id] = record
     return validated
+
+
+def _bound_session_artifact(
+    session: Session, value: object, label: str
+) -> Path:
+    if not isinstance(value, str):
+        raise ValueError(f"administrative {label} path is invalid")
+    path = _session_artifact_path(value, label)
+    if path.parent != session.path:
+        raise ValueError(f"administrative {label} is outside the bound session")
+    return path
+
+
+def _read_owned_regular_bytes(
+    path: Path,
+    label: str,
+    owner_uid: object,
+    owner_gid: object,
+    mode: int,
+) -> bytes:
+    if type(owner_uid) is not int or type(owner_gid) is not int:
+        raise ValueError(f"{label} owner binding is invalid")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != owner_uid
+            or before.st_gid != owner_gid
+            or stat.S_IMODE(before.st_mode) != mode
+            or before.st_size > 16 * 1024 * 1024
+        ):
+            raise ValueError(f"{label} owner, mode, type, or size is unsafe")
+        remaining = before.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError(f"{label} was truncated while validating")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError(f"{label} grew while validating")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_gid,
+            before.st_mode,
+            before.st_mtime_ns,
+            before.st_size,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_gid,
+            after.st_mode,
+            after.st_mtime_ns,
+            after.st_size,
+        ):
+            raise ValueError(f"{label} changed while validating")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _require_owned_regular_file(
