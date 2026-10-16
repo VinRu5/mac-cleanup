@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Executable wrapper for the mac-cleanup CLI."""
 
-from mac_cleanup.cli import main
+def run() -> int:
+    """Import the package only when the executable is invoked."""
+    from mac_cleanup.cli import main
+
+    return main()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())

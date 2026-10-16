@@ -29,6 +29,9 @@ class BatchOutcome:
     suspended: bool = False
     regenerated_bytes: int = 0
     regenerated_target_ids: tuple[str, ...] = field(default_factory=tuple)
+    logical_bytes_removed_by_target: tuple[tuple[str, int], ...] = field(
+        default_factory=tuple
+    )
 
     @property
     def free_space_delta(self) -> int | None:
@@ -122,6 +125,7 @@ def _apply_batch_locked(
 
     before = _free_space(roots, persisted)
     removed = 0
+    removed_by_target: list[tuple[str, int]] = []
     runtime_issues: list[Issue] = []
     for result in preflights:
         status = session.status(result.target.id)
@@ -141,7 +145,9 @@ def _apply_batch_locked(
         assert result.identity is not None
         try:
             session.assert_operation_lock_current()
-            removed += remove_tree_exact(result.identity, roots)
+            target_removed = remove_tree_exact(result.identity, roots)
+            removed += target_removed
+            removed_by_target.append((result.target.id, target_removed))
         except PathSafetyError as error:
             runtime_issues.append(_issue_from_safety_error(result.target, error))
             break
@@ -172,6 +178,7 @@ def _apply_batch_locked(
             batch_id=persisted.id,
             issues=issues + runtime,
             logical_bytes_removed=removed,
+            logical_bytes_removed_by_target=tuple(removed_by_target),
             free_space_before=before,
             free_space_after=after,
             suspended=True,
@@ -182,6 +189,7 @@ def _apply_batch_locked(
         batch_id=persisted.id,
         issues=issues,
         logical_bytes_removed=removed,
+        logical_bytes_removed_by_target=tuple(removed_by_target),
         free_space_before=before,
         free_space_after=after,
         regenerated_bytes=regenerated_bytes,
