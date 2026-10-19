@@ -148,3 +148,54 @@ published its inventory.
 - Confirmed all new concurrency and filesystem tests use temporary trusted-home
   fixtures only; no production data is scanned or deleted.
 - Confirmed `.superpowers/sdd/2026-10-08-mac-cleanup-mvp/progress.md` is unchanged.
+
+## Fix round 2
+
+Status: DONE
+
+### Review findings addressed
+
+- Added a strict, read-only outcome-history preflight shared by apply and verify.
+  Both commands now hold one reentrant `Session.operation_lock` from that preflight
+  through dry-run/admin import or generation/direct execution and non-dry outcome
+  recording. Missing accounting remains an in-memory empty history; dry-run does not
+  create it. Malformed history returns code `2` before target or lifecycle mutation.
+- Cooperative concurrent history writers now order wholly before preflight or after
+  outcome recording. Fixture regressions cover a forged writer ordered before apply
+  and a writer blocked across the mutation-to-accounting boundary.
+- Inventory target paths now compare the original raw JSON string exactly with the
+  absolute resolved canonical spelling. Trailing slashes, dot segments, duplicate
+  separators, symlink aliases, relative paths, control characters, and unresolvable
+  paths fail before manifest/state writes.
+- Outcome issues must equal the canonical serializer round-trip order and be unique.
+  Reversed and duplicate otherwise-valid issues return code `2` without report
+  mutation. Per-target removals, regenerated ids, operations, and inventory lists
+  retain sorted/unique validation; inventory issues are now unique as well.
+
+### RED evidence
+
+`python3 -m unittest tests.test_reporting tests.test_cli`
+
+Initial result: 10 failures. Apply deleted an approved fixture despite forged outcome
+history; verify changed lifecycle; trailing-slash, dot-segment, and duplicate-separator
+paths reached a manifest; reversed/duplicate issues rendered successfully; and the
+concurrent forged history was accepted after lock ordering.
+
+### GREEN evidence
+
+- `python3 -m unittest tests.test_reporting tests.test_cli` — 25 tests passed.
+- `python3 -m unittest discover -s tests -v` — 126 tests passed.
+- `python3 -m py_compile scripts/mac_cleanup.py scripts/mac_cleanup/*.py scripts/mac_cleanup/modules/*.py tests/*.py`
+  — passed.
+- `git diff --check` — passed.
+
+### Fix-round self-review
+
+- Confirmed outcome validation precedes direct apply, verify, administrative import,
+  and administrative artifact generation while preserving read-only dry-run behavior.
+- Confirmed the outer command lock is reentrant with executor, session, Task 9, and
+  accounting helpers and covers the entire mutation/accounting transaction.
+- Confirmed raw path validation uses the unnormalized source string and converts path
+  resolution errors to invalid input rather than exposing runtime exceptions.
+- Confirmed tests use only temporary trusted-home fixtures; production paths are not
+  scanned or deleted, and `progress.md` remains unchanged.

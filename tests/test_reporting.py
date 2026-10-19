@@ -201,6 +201,10 @@ class ReportingTest(unittest.TestCase):
                 free_space_before=100,
                 free_space_after=105,
                 regenerated_bytes=1,
+                issues=(
+                    Issue("z.warning", Severity.WARNING, "later"),
+                    Issue("a.info", Severity.INFORMATIONAL, "earlier"),
+                ),
             ),
         )
         path = self.session.path / "outcomes.json"
@@ -214,6 +218,10 @@ class ReportingTest(unittest.TestCase):
             "negative regenerated": lambda item: item.update(regenerated_bytes=-1),
             "boolean sequence": lambda item: item.update(sequence=True),
             "empty regenerated id": lambda item: item["regenerated_target_ids"].append(""),
+            "reversed issues": lambda item: item["issues"].reverse(),
+            "duplicate issue": lambda item: item["issues"].append(
+                copy.deepcopy(item["issues"][0])
+            ),
             "unknown field": lambda item: item.update(forged=True),
             "noncanonical issue": lambda item: item["issues"].append(
                 {

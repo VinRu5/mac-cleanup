@@ -21,6 +21,23 @@ class AdministrativeArtifactError(ValueError):
     """Raised when a bound manual artifact fails the Task 9 engine validator."""
 
 
+def validate_outcome_history(session: Session) -> None:
+    """Strictly validate existing accounting without creating or changing it."""
+    if not isinstance(session, Session):
+        raise TypeError("session must be a Session")
+    with session.operation_lock():
+        manifest = session.read_manifest()
+        path = _outcomes_path(session)
+        document = (
+            _read_outcomes(path)
+            if path.exists()
+            else {"schema_version": OUTCOMES_SCHEMA_VERSION, "operations": []}
+        )
+        operations = document["operations"]
+        assert isinstance(operations, list)
+        _validate_operations_membership(manifest, operations)
+
+
 def record_batch_outcome(
     session: Session, operation: str, outcome: BatchOutcome
 ) -> None:
@@ -235,6 +252,7 @@ def _validate_outcome(value: object, sequence: int) -> None:
     issues = value["issues"]
     if not isinstance(issues, list):
         raise ValueError("outcome issues are invalid")
+    parsed_issues: list[Issue] = []
     for issue in issues:
         if not isinstance(issue, Mapping):
             raise ValueError("outcome issue is invalid")
@@ -252,6 +270,14 @@ def _validate_outcome(value: object, sequence: int) -> None:
             )
         ):
             raise ValueError("outcome issue does not match schema")
+        parsed_issues.append(parsed)
+    issue_keys = [_issue_key(issue) for issue in parsed_issues]
+    if (
+        [dict(issue) for issue in issues]
+        != [issue.to_dict() for issue in sorted(parsed_issues, key=_issue_key)]
+        or len(issue_keys) != len(set(issue_keys))
+    ):
+        raise ValueError("outcome issues are not canonical and unique")
     removed = value["logical_bytes_removed_by_target"]
     if not isinstance(removed, list):
         raise ValueError("outcome target removals are invalid")

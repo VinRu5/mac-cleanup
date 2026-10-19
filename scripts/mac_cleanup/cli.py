@@ -21,6 +21,7 @@ from .reporting import (
     AdministrativeArtifactError,
     record_batch_outcome,
     render_report,
+    validate_outcome_history,
 )
 from .sessions import InvalidTransition, Session
 
@@ -184,96 +185,99 @@ def _plan(session_path: Path) -> int:
 
 def _apply(session_path: Path, batch_id: str, dry_run: bool, home: Path) -> int:
     session = Session.load(session_path)
-    batch = _named_batch(session, batch_id)
-    roots = _trusted_allowed_roots(batch, _canonical_home(home))
-    if dry_run:
-        outcome = apply_batch(session, batch, roots, dry_run=True)
-        _print_json(_outcome_summary("apply", outcome))
-        return _outcome_exit(outcome)
+    with session.operation_lock():
+        validate_outcome_history(session)
+        batch = _named_batch(session, batch_id)
+        roots = _trusted_allowed_roots(batch, _canonical_home(home))
+        if dry_run:
+            outcome = apply_batch(session, batch, roots, dry_run=True)
+            _print_json(_outcome_summary("apply", outcome))
+            return _outcome_exit(outcome)
 
-    preview = apply_batch(session, batch, roots, dry_run=True)
-    if _administrative_fallback_required(preview):
-        script_path = session.path / f"admin-{batch.id}.zsh"
-        result_path = session.path / f"admin-{batch.id}-result.json"
-        try:
-            checksum = generate_admin_script(
-                batch,
-                script_path,
-                result_path,
-                trusted_home=home,
-            )
-        except (OSError, TypeError, ValueError):
+        preview = apply_batch(session, batch, roots, dry_run=True)
+        if _administrative_fallback_required(preview):
+            script_path = session.path / f"admin-{batch.id}.zsh"
+            result_path = session.path / f"admin-{batch.id}-result.json"
+            try:
+                checksum = generate_admin_script(
+                    batch,
+                    script_path,
+                    result_path,
+                    trusted_home=home,
+                )
+            except (OSError, TypeError, ValueError):
+                _print_json(
+                    {
+                        "batch_id": batch.id,
+                        "command": "apply",
+                        "critical_issue": "administrative artifact validation failed",
+                    }
+                )
+                return CRITICAL_SAFETY_FAILURE
             _print_json(
                 {
                     "batch_id": batch.id,
+                    "checksum": checksum,
                     "command": "apply",
-                    "critical_issue": "administrative artifact validation failed",
+                    "manual_precondition": (
+                        "Execute exactly the engine-validated script path, not a copy or "
+                        "replacement, only after confirming this checksum. Validation does not "
+                        "close the later same-UID manual execution gap."
+                    ),
+                    "result_path": str(result_path),
+                    "script_path": str(script_path),
+                    "status": "administrative_fallback_required",
                 }
             )
-            return CRITICAL_SAFETY_FAILURE
-        _print_json(
-            {
-                "batch_id": batch.id,
-                "checksum": checksum,
-                "command": "apply",
-                "manual_precondition": (
-                    "Execute exactly the engine-validated script path, not a copy or "
-                    "replacement, only after confirming this checksum. Validation does not "
-                    "close the later same-UID manual execution gap."
-                ),
-                "result_path": str(result_path),
-                "script_path": str(script_path),
-                "status": "administrative_fallback_required",
-            }
-        )
-        return BATCH_SUSPENDED
+            return BATCH_SUSPENDED
 
-    outcome = apply_batch(session, batch, roots)
-    record_batch_outcome(session, "apply", outcome)
-    _print_json(_outcome_summary("apply", outcome))
-    return _outcome_exit(outcome)
+        outcome = apply_batch(session, batch, roots)
+        record_batch_outcome(session, "apply", outcome)
+        _print_json(_outcome_summary("apply", outcome))
+        return _outcome_exit(outcome)
 
 
 def _verify(session_path: Path, batch_id: str, home: Path) -> int:
     session = Session.load(session_path)
-    binding = session.admin_script_binding(batch_id)
-    if binding is not None:
-        result_path = binding.get("result_path")
-        checksum = binding.get("checksum")
-        if not isinstance(result_path, str) or not isinstance(checksum, str):
-            raise ValueError("administrative binding is malformed")
-        try:
-            import_admin_results(
-                session,
-                result_path,
-                checksum,
-                trusted_home=home,
-            )
-        except (OSError, TypeError, ValueError):
-            _print_json(
-                {
-                    "batch_id": batch_id,
-                    "command": "verify",
-                    "critical_issue": "administrative artifact validation failed",
-                }
-            )
-            return CRITICAL_SAFETY_FAILURE
-        session = Session.load(session_path)
-        critical = session.critical_issue()
-        if critical is not None:
-            _print_json({"batch_id": batch_id, "command": "verify", "critical_issue": critical.to_dict()})
-            return CRITICAL_SAFETY_FAILURE
+    with session.operation_lock():
+        validate_outcome_history(session)
+        binding = session.admin_script_binding(batch_id)
+        if binding is not None:
+            result_path = binding.get("result_path")
+            checksum = binding.get("checksum")
+            if not isinstance(result_path, str) or not isinstance(checksum, str):
+                raise ValueError("administrative binding is malformed")
+            try:
+                import_admin_results(
+                    session,
+                    result_path,
+                    checksum,
+                    trusted_home=home,
+                )
+            except (OSError, TypeError, ValueError):
+                _print_json(
+                    {
+                        "batch_id": batch_id,
+                        "command": "verify",
+                        "critical_issue": "administrative artifact validation failed",
+                    }
+                )
+                return CRITICAL_SAFETY_FAILURE
+            critical = session.critical_issue()
+            if critical is not None:
+                _print_json({"batch_id": batch_id, "command": "verify", "critical_issue": critical.to_dict()})
+                return CRITICAL_SAFETY_FAILURE
+            batch = _named_batch(session, batch_id)
+            statuses = tuple(session.status(target.id) for target in batch.targets)
+            if any(status == "suspended" for status in statuses):
+                _print_json({"batch_id": batch_id, "command": "verify", "status": "suspended"})
+                return BATCH_SUSPENDED
         batch = _named_batch(session, batch_id)
-        statuses = tuple(session.status(target.id) for target in batch.targets)
-        if any(status == "suspended" for status in statuses):
-            _print_json({"batch_id": batch_id, "command": "verify", "status": "suspended"})
-            return BATCH_SUSPENDED
-    batch = _named_batch(session, batch_id)
-    roots = _trusted_allowed_roots(batch, _canonical_home(home))
-    outcome = verify_batch(session, batch, roots)
-    record_batch_outcome(session, "verify", outcome)
-    _print_json(_outcome_summary("verify", outcome))
-    return _outcome_exit(outcome)
+        roots = _trusted_allowed_roots(batch, _canonical_home(home))
+        outcome = verify_batch(session, batch, roots)
+        record_batch_outcome(session, "verify", outcome)
+        _print_json(_outcome_summary("verify", outcome))
+        return _outcome_exit(outcome)
 
 
 def _scan_result(value: Mapping[str, object]) -> ScanResult:
@@ -333,17 +337,22 @@ def _scan_result(value: Mapping[str, object]) -> ScanResult:
         ):
             raise ValueError("inventory target fields are invalid")
         prefix, separator, name = target.id.partition(":")
-        path = Path(target.path)
+        raw_path = target.path
+        path = Path(raw_path)
         if (
             not prefix
             or not separator
             or not name
             or not path.is_absolute()
             or ".." in path.parts
-            or path.resolve(strict=False) != path
-            or path.name != name
             or any(character in target.path for character in ("\0", "\n", "\r"))
         ):
+            raise ValueError("inventory target identity is invalid")
+        try:
+            canonical_path = str(path.resolve(strict=False))
+        except (OSError, RuntimeError) as error:
+            raise ValueError("inventory target path cannot be resolved") from error
+        if raw_path != canonical_path or path.name != name:
             raise ValueError("inventory target identity is invalid")
         if target.fingerprint and not re.fullmatch(r"[0-9a-f]{64}", target.fingerprint):
             raise ValueError("inventory target fingerprint is invalid")
@@ -372,6 +381,9 @@ def _scan_result(value: Mapping[str, object]) -> ScanResult:
         parsed_issues.append(issue)
     if parsed_issues != sorted(parsed_issues, key=_issue_key):
         raise ValueError("inventory issues are not sorted")
+    issue_keys = [_issue_key(issue) for issue in parsed_issues]
+    if len(issue_keys) != len(set(issue_keys)):
+        raise ValueError("inventory issues are not unique")
     return ScanResult(
         targets=tuple(parsed_targets),
         issues=tuple(parsed_issues),

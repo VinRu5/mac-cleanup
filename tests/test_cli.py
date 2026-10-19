@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.mac_cleanup.executor import BatchOutcome
+from scripts.mac_cleanup.executor import BatchOutcome, apply_batch as engine_apply_batch
 from scripts.mac_cleanup.cli import _plan, _scan, _scan_result, build_parser, main
 from scripts.mac_cleanup.jsonio import atomic_write_json, read_json
 from scripts.mac_cleanup.manifests import approval_digest, build_manifest
@@ -151,6 +151,7 @@ class CliTest(unittest.TestCase):
             ], trusted_home=home), 0)
             self.assertEqual(Session.load(session.path).state, state_before)
             self.assertTrue(all(Path(target.path).exists() for target in targets))
+            self.assertFalse((session.path / "outcomes.json").exists())
 
             self.assertEqual(main([
                 "apply", "--session", str(session.path),
@@ -286,18 +287,248 @@ class CliTest(unittest.TestCase):
                     logical_bytes_removed_by_target=((target.id, 4),),
                     free_space_before=10,
                     free_space_after=14,
+                    issues=(
+                        Issue("z.warning", Severity.WARNING, "later"),
+                        Issue("a.info", Severity.INFORMATIONAL, "earlier"),
+                    ),
                 ),
             )
             outcomes_path = session.path / "outcomes.json"
-            document = read_json(outcomes_path)
-            document["operations"][0]["free_space_delta"] = 4_000_000
-            atomic_write_json(outcomes_path, document)
+            valid = read_json(outcomes_path)
+            mutations = {
+                "forged delta": lambda item: item.update(free_space_delta=4_000_000),
+                "reversed issues": lambda item: item["issues"].reverse(),
+                "duplicate issue": lambda item: item["issues"].append(
+                    copy.deepcopy(item["issues"][0])
+                ),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    document = copy.deepcopy(valid)
+                    mutate(document["operations"][0])
+                    atomic_write_json(outcomes_path, document)
 
-            code, output = self._run(["report", "--session", str(session.path)])
+                    code, output = self._run(
+                        ["report", "--session", str(session.path)]
+                    )
 
-            self.assertEqual(code, 2)
-            self.assertEqual(output, "")
-            self.assertFalse(session.report_path.exists())
+                    self.assertEqual(code, 2)
+                    self.assertEqual(output, "")
+                    self.assertFalse(session.report_path.exists())
+
+    def test_apply_and_verify_reject_existing_forged_outcomes_before_mutation(self) -> None:
+        for command, dry_run in (("apply", False), ("apply", True), ("verify", False)):
+            with self.subTest(command=command, dry_run=dry_run), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                home = root / "home"
+                cache_root = home / "Library" / "Caches"
+                target_path = cache_root / "blocked"
+                target_path.mkdir(parents=True)
+                (target_path / "entry.bin").write_bytes(b"keep")
+                identity = inspect_path(target_path, (cache_root,))
+                target = Target(
+                    id="user-caches:blocked",
+                    path=identity.canonical,
+                    kind=identity.kind,
+                    risk=Risk.SAFE_REGENERABLE,
+                    fingerprint=identity.fingerprint,
+                    logical_bytes=identity.logical_bytes,
+                )
+                batch = Batch("safe-user-caches", (target,))
+                session = Session.create(root / "session")
+                session.write_manifest(
+                    Manifest(batches=(batch,), inventory_digest="a" * 64)
+                )
+                session.transition(target.id, "approved")
+                if command == "verify":
+                    session.transition(target.id, "applied")
+                from scripts.mac_cleanup.reporting import record_batch_outcome
+
+                record_batch_outcome(
+                    session,
+                    "apply",
+                    BatchOutcome(
+                        batch_id=batch.id,
+                        free_space_before=100,
+                        free_space_after=105,
+                    ),
+                )
+                outcomes_path = session.path / "outcomes.json"
+                forged = read_json(outcomes_path)
+                forged["operations"][0]["free_space_delta"] = 999
+                atomic_write_json(outcomes_path, forged)
+                state_before = Session.load(session.path).state
+                outcomes_before = outcomes_path.read_bytes()
+
+                arguments = [
+                    command,
+                    "--session",
+                    str(session.path),
+                    "--batch",
+                    batch.id,
+                ]
+                if dry_run:
+                    arguments.append("--dry-run")
+                code, output = self._run(arguments, trusted_home=home)
+
+                self.assertEqual(code, 2)
+                self.assertEqual(output, "")
+                self.assertTrue(target_path.exists())
+                self.assertEqual(Session.load(session.path).state, state_before)
+                self.assertEqual(outcomes_path.read_bytes(), outcomes_before)
+
+    def test_apply_orders_concurrent_outcome_replacement_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "ordered"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"keep")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:ordered",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            from scripts.mac_cleanup.reporting import record_batch_outcome
+
+            record_batch_outcome(
+                session,
+                "apply",
+                BatchOutcome(
+                    batch_id=batch.id,
+                    free_space_before=100,
+                    free_space_after=105,
+                ),
+            )
+            outcomes_path = session.path / "outcomes.json"
+            forged = read_json(outcomes_path)
+            forged["operations"][0]["free_space_delta"] = 999
+            replacement_written = threading.Event()
+            release_replacer = threading.Event()
+            apply_started = threading.Event()
+            apply_done = threading.Event()
+            result: dict[str, int] = {}
+
+            def replace_while_locked() -> None:
+                replacing = Session.load(session.path)
+                with replacing.operation_lock():
+                    atomic_write_json(outcomes_path, forged)
+                    replacement_written.set()
+                    if not release_replacer.wait(5):
+                        raise AssertionError("test did not release outcome replacer")
+
+            def apply_operation() -> None:
+                apply_started.set()
+                result["code"] = main(
+                    ["apply", "--session", str(session.path), "--batch", batch.id],
+                    trusted_home=home,
+                )
+                apply_done.set()
+
+            replacing_thread = threading.Thread(target=replace_while_locked)
+            replacing_thread.start()
+            self.assertTrue(replacement_written.wait(5))
+            with patch("scripts.mac_cleanup.cli._print_json"):
+                applying_thread = threading.Thread(target=apply_operation)
+                applying_thread.start()
+                self.assertTrue(apply_started.wait(5))
+                self.assertFalse(apply_done.wait(0.1))
+                release_replacer.set()
+                replacing_thread.join(5)
+                applying_thread.join(5)
+
+            self.assertFalse(replacing_thread.is_alive())
+            self.assertFalse(applying_thread.is_alive())
+            self.assertEqual(result, {"code": 2})
+            self.assertTrue(target_path.exists())
+            self.assertEqual(Session.load(session.path).status(target.id), "approved")
+
+    def test_apply_holds_one_lock_from_preflight_through_outcome_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "coherent-apply"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"delete")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:coherent-apply",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            mutation_finished = threading.Event()
+            replacement_attempted = threading.Event()
+            replacement_done = threading.Event()
+            results: dict[str, int] = {}
+
+            def observed_apply(*args: object, **kwargs: object) -> BatchOutcome:
+                outcome = engine_apply_batch(*args, **kwargs)
+                if not kwargs.get("dry_run", False):
+                    mutation_finished.set()
+                    if not replacement_attempted.wait(5):
+                        raise AssertionError("replacement thread did not attempt the lock")
+                    if replacement_done.wait(0.1):
+                        raise AssertionError("outcome replacement entered the transaction")
+                return outcome
+
+            def replace_outcomes() -> None:
+                if not mutation_finished.wait(5):
+                    raise AssertionError("apply did not reach its mutation checkpoint")
+                replacement_attempted.set()
+                replacing = Session.load(session.path)
+                with replacing.operation_lock():
+                    atomic_write_json(
+                        session.path / "outcomes.json",
+                        {
+                            "schema_version": 1,
+                            "operations": [{"forged": True}],
+                        },
+                    )
+                replacement_done.set()
+
+            def apply_operation() -> None:
+                results["code"] = main(
+                    ["apply", "--session", str(session.path), "--batch", batch.id],
+                    trusted_home=home,
+                )
+
+            replacement_thread = threading.Thread(target=replace_outcomes)
+            replacement_thread.start()
+            with patch("scripts.mac_cleanup.cli.apply_batch", side_effect=observed_apply), patch(
+                "scripts.mac_cleanup.cli._print_json"
+            ):
+                applying_thread = threading.Thread(target=apply_operation)
+                applying_thread.start()
+                applying_thread.join(5)
+            replacement_thread.join(5)
+
+            self.assertFalse(applying_thread.is_alive())
+            self.assertFalse(replacement_thread.is_alive())
+            self.assertEqual(results, {"code": 0})
+            self.assertTrue(replacement_done.is_set())
+            self.assertFalse(target_path.exists())
+            self.assertEqual(Session.load(session.path).status(target.id), "verified")
 
     def test_report_returns_four_for_tampered_bound_artifact_after_verified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -438,6 +669,66 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(output, "")
                 self.assertEqual(Session.load(session.path).state, state_before)
                 self.assertFalse(session.manifest_path.exists())
+
+    def test_plan_rejects_noncanonical_raw_path_spellings_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_root = Path(directory).resolve()
+            real = fixture_root / "real"
+            real.mkdir()
+            alias = fixture_root / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            canonical = real / "valid"
+            raw_paths = {
+                "trailing slash": f"{canonical}/",
+                "dot segment": f"{real}/./valid",
+                "duplicate separator": f"{fixture_root}//real/valid",
+                "symlink alias": f"{alias}/valid",
+                "relative": "real/valid",
+            }
+            for label, raw_path in raw_paths.items():
+                with self.subTest(label=label), tempfile.TemporaryDirectory() as session_dir:
+                    session = Session.create(Path(session_dir).resolve() / "session")
+                    session.write_policy(
+                        {
+                            "schema_version": 1,
+                            "enabled_modules": ["user-caches"],
+                            "preserve_target_ids": [],
+                            "allow_review_required": False,
+                            "deep_scan_threshold_bytes": 1,
+                        }
+                    )
+                    session.write_inventory(
+                        {
+                            "capabilities": {
+                                "modules": [{"detected": True, "id": "user-caches"}],
+                                "tools": [{"available": True, "name": "python3"}],
+                            },
+                            "executable_target_ids": ["user-caches:valid"],
+                            "issues": [],
+                            "schema_version": 1,
+                            "targets": [
+                                {
+                                    "id": "user-caches:valid",
+                                    "path": raw_path,
+                                    "kind": "directory",
+                                    "risk": "safe_regenerable",
+                                    "status": "pending",
+                                    "fingerprint": "a" * 64,
+                                    "logical_bytes": 1,
+                                }
+                            ],
+                        }
+                    )
+                    state_before = session.state
+
+                    code, output = self._run(
+                        ["plan", "--session", str(session.path)]
+                    )
+
+                    self.assertEqual(code, 2)
+                    self.assertEqual(output, "")
+                    self.assertEqual(Session.load(session.path).state, state_before)
+                    self.assertFalse(session.manifest_path.exists())
 
     def test_scan_and_plan_are_serialized_and_plan_binds_complete_inventory(self) -> None:
         with fake_home() as home, tempfile.TemporaryDirectory() as directory:
