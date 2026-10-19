@@ -40,7 +40,9 @@ def record_batch_outcome(
         )
         operations = document["operations"]
         assert isinstance(operations, list)
-        operations.append(_outcome_value(len(operations) + 1, operation, outcome))
+        value = _outcome_value(len(operations) + 1, operation, outcome)
+        _validate_outcome(value, len(operations) + 1)
+        operations.append(value)
         atomic_write_json(path, document)
 
 
@@ -131,14 +133,12 @@ def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
             binding = bindings[batch_id]
             if not isinstance(binding, Mapping):
                 raise ValueError("session administrative binding is malformed")
-            validation = validations.get(batch_id)
-            if validation is None:
-                lines.append(
-                    f"- `{batch_id}`: no current manual execution authorization; "
-                    "the batch is no longer entirely approved."
-                )
-                continue
-            lines.extend(_admin_lines(validation))
+            validation = validations[batch_id]
+            batch = next(batch for batch in manifest.batches if batch.id == batch_id)
+            authorized = all(
+                statuses.get(target.id) == "approved" for target in batch.targets
+            )
+            lines.extend(_admin_lines(validation, authorized=authorized))
         lines.append("")
 
     lines.extend(["## Required user actions", ""])
@@ -183,7 +183,10 @@ def _read_outcomes(path: Path) -> dict[str, object]:
     value = read_json(path)
     if set(value) != {"schema_version", "operations"}:
         raise ValueError("outcomes fields do not match schema")
-    if value["schema_version"] != OUTCOMES_SCHEMA_VERSION:
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != OUTCOMES_SCHEMA_VERSION
+    ):
         raise ValueError("outcomes schema_version must be 1")
     operations = value["operations"]
     if not isinstance(operations, list):
@@ -202,7 +205,11 @@ def _validate_outcome(value: object, sequence: int) -> None:
         "logical_bytes_removed_by_target", "operation", "regenerated_bytes",
         "regenerated_target_ids", "sequence", "suspended",
     }
-    if set(value) != expected or value["sequence"] != sequence:
+    if (
+        set(value) != expected
+        or type(value["sequence"]) is not int
+        or value["sequence"] != sequence
+    ):
         raise ValueError("outcome fields or sequence do not match schema")
     if value["operation"] not in {"apply", "verify"}:
         raise ValueError("outcome operation is invalid")
@@ -217,13 +224,34 @@ def _validate_outcome(value: object, sequence: int) -> None:
     for key in ("free_space_before", "free_space_after", "free_space_delta"):
         if value[key] is not None and type(value[key]) is not int:
             raise ValueError("outcome free-space measurement is invalid")
+    before = value["free_space_before"]
+    after = value["free_space_after"]
+    delta = value["free_space_delta"]
+    if before is None or after is None:
+        if before is not None or after is not None or delta is not None:
+            raise ValueError("outcome free-space unknowns are inconsistent")
+    elif before < 0 or after < 0 or delta != after - before:
+        raise ValueError("outcome free-space accounting is inconsistent")
     issues = value["issues"]
     if not isinstance(issues, list):
         raise ValueError("outcome issues are invalid")
     for issue in issues:
         if not isinstance(issue, Mapping):
             raise ValueError("outcome issue is invalid")
-        Issue.from_dict(issue)
+        parsed = Issue.from_dict(issue)
+        if (
+            dict(issue) != parsed.to_dict()
+            or not parsed.code
+            or not parsed.message
+            or (
+                parsed.target_id is not None
+                and (
+                    not isinstance(parsed.target_id, str)
+                    or not parsed.target_id
+                )
+            )
+        ):
+            raise ValueError("outcome issue does not match schema")
     removed = value["logical_bytes_removed_by_target"]
     if not isinstance(removed, list):
         raise ValueError("outcome target removals are invalid")
@@ -233,11 +261,23 @@ def _validate_outcome(value: object, sequence: int) -> None:
             raise ValueError("outcome target removal is invalid")
         target_id = item["target_id"]
         count = item["logical_bytes_removed"]
-        if not isinstance(target_id, str) or target_id in seen or type(count) is not int or count < 0:
+        if (
+            not isinstance(target_id, str)
+            or not target_id
+            or target_id in seen
+            or type(count) is not int
+            or count < 0
+        ):
             raise ValueError("outcome target removal is invalid")
         seen.add(target_id)
+    if [item["target_id"] for item in removed] != sorted(seen):
+        raise ValueError("outcome target removals are not sorted")
     ids = value["regenerated_target_ids"]
-    if not isinstance(ids, list) or ids != sorted(set(ids)) or not all(isinstance(item, str) for item in ids):
+    if (
+        not isinstance(ids, list)
+        or ids != sorted(set(ids))
+        or not all(isinstance(item, str) and item for item in ids)
+    ):
         raise ValueError("outcome regenerated target ids are invalid")
 
 
@@ -297,28 +337,43 @@ def _admin_validations(
         batch = batches.get(batch_id)
         if batch is None:
             raise ValueError("administrative binding names an unknown batch")
-        if all(statuses.get(target.id) == "approved" for target in batch.targets):
-            try:
-                validations[batch_id] = validate_admin_artifacts(
-                    session, batch_id, trusted_home=trusted_home
-                )
-            except (OSError, TypeError, ValueError) as error:
-                raise AdministrativeArtifactError(
-                    f"administrative artifacts failed engine validation: {batch_id}"
-                ) from error
+        try:
+            validations[batch_id] = validate_admin_artifacts(
+                session,
+                batch_id,
+                trusted_home=trusted_home,
+                require_approved=False,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise AdministrativeArtifactError(
+                f"administrative artifacts failed engine validation: {batch_id}"
+            ) from error
     return validations
 
 
-def _admin_lines(validation: AdminArtifactValidation) -> list[str]:
-    return [
+def _admin_lines(
+    validation: AdminArtifactValidation, *, authorized: bool
+) -> list[str]:
+    lines = [
         f"- `{validation.batch_id}` engine validation: passed",
         f"  - Exact script: `{validation.script_path}`",
         f"  - Validated SHA-256: `{validation.checksum}`",
-        "  - Manual precondition: execute exactly that validated script path, not a copy "
-        "or replacement, only after confirming this checksum.",
-        "  - Boundary: validation does not close the later manual validation-to-execution "
-        "gap against a malicious same-UID actor.",
     ]
+    if authorized:
+        lines.append(
+            "  - Manual precondition: execute exactly that validated script path, not a copy "
+            "or replacement, only after confirming this checksum."
+        )
+    else:
+        lines.append(
+            "  - Lifecycle: integrity passed, but this batch is not currently authorized "
+            "for manual execution."
+        )
+    lines.append(
+        "  - Boundary: validation does not close the later manual validation-to-execution "
+        "gap against a malicious same-UID actor."
+    )
+    return lines
 
 
 def _required_actions(
@@ -339,7 +394,9 @@ def _required_actions(
         )
     for batch in sorted(manifest.batches, key=lambda value: value.id):
         validation = validations.get(batch.id)
-        if validation is not None:
+        if validation is not None and all(
+            statuses.get(target.id) == "approved" for target in batch.targets
+        ):
             actions.append(
                 f"For `{batch.id}`, confirm SHA-256 `{validation.checksum}`, then execute "
                 f"exactly `{validation.script_path}` and run `verify --batch {batch.id}` "

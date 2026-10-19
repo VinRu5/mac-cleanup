@@ -1,11 +1,17 @@
 import tempfile
 import unittest
+import copy
 from pathlib import Path
 
 from scripts.mac_cleanup.admin_script import generate_admin_script
 from scripts.mac_cleanup.executor import BatchOutcome
+from scripts.mac_cleanup.jsonio import atomic_write_json, read_json
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Severity, Target
-from scripts.mac_cleanup.reporting import record_batch_outcome, render_report
+from scripts.mac_cleanup.reporting import (
+    AdministrativeArtifactError,
+    record_batch_outcome,
+    render_report,
+)
 from scripts.mac_cleanup.sessions import Session
 from scripts.mac_cleanup.paths import inspect_path
 
@@ -169,6 +175,104 @@ class ReportingTest(unittest.TestCase):
         self.assertIn(checksum, report)
         self.assertIn("execute exactly that validated script path, not a copy", report)
         self.assertIn("does not close the later manual validation-to-execution gap", report)
+
+    def test_report_rejects_forged_or_internally_inconsistent_outcomes(self) -> None:
+        target = Target(
+            id="user-caches:accounted",
+            path=str(self.root / "home" / "Library" / "Caches" / "accounted"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch("safe-user-caches", (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        record_batch_outcome(
+            self.session,
+            "apply",
+            BatchOutcome(
+                batch_id="safe-user-caches",
+                logical_bytes_removed=5,
+                logical_bytes_removed_by_target=((target.id, 5),),
+                free_space_before=100,
+                free_space_after=105,
+                regenerated_bytes=1,
+            ),
+        )
+        path = self.session.path / "outcomes.json"
+        valid = read_json(path)
+        mutations = {
+            "forged delta": lambda item: item.update(free_space_delta=999),
+            "partial endpoints": lambda item: item.update(
+                free_space_before=None, free_space_delta=None
+            ),
+            "negative endpoint": lambda item: item.update(free_space_after=-1),
+            "negative regenerated": lambda item: item.update(regenerated_bytes=-1),
+            "boolean sequence": lambda item: item.update(sequence=True),
+            "empty regenerated id": lambda item: item["regenerated_target_ids"].append(""),
+            "unknown field": lambda item: item.update(forged=True),
+            "noncanonical issue": lambda item: item["issues"].append(
+                {
+                    "code": "bad",
+                    "severity": "warning",
+                    "message": "bad",
+                    "unknown": True,
+                }
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                document = copy.deepcopy(valid)
+                mutate(document["operations"][0])
+                atomic_write_json(path, document)
+                with self.assertRaises(ValueError):
+                    render_report(self.session)
+        atomic_write_json(path, valid)
+
+    def test_report_validates_bound_admin_artifacts_after_batch_is_verified(self) -> None:
+        home = self.root / "home"
+        cache_root = home / "Library" / "Caches"
+        target_path = cache_root / "admin-cache"
+        target_path.mkdir(parents=True)
+        (target_path / "entry.bin").write_bytes(b"cache")
+        identity = inspect_path(target_path, (cache_root,))
+        target = Target(
+            id="user-caches:admin-cache",
+            path=identity.canonical,
+            kind=identity.kind,
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint=identity.fingerprint,
+            logical_bytes=identity.logical_bytes,
+        )
+        batch = Batch("safe-user-caches", (target,))
+        self.session.write_manifest(
+            Manifest(batches=(batch,), inventory_digest="c" * 64)
+        )
+        self.session.transition(target.id, "approved")
+        script_path = self.session.path / "admin.zsh"
+        generate_admin_script(
+            batch,
+            script_path,
+            self.session.path / "admin-result.json",
+            trusted_home=home,
+        )
+        self.session.transition(target.id, "applied")
+        self.session.transition(target.id, "verified")
+        terminal_report = render_report(self.session, trusted_home=home)
+        self.assertIn("engine validation: passed", terminal_report)
+        self.assertIn("not currently authorized for manual execution", terminal_report)
+        self.assertNotIn("then execute exactly", terminal_report)
+        script_path.write_text("#!/bin/zsh\nexit 0\n", encoding="utf-8")
+        state_before = self.session.state
+
+        with self.assertRaises(AdministrativeArtifactError):
+            render_report(self.session, trusted_home=home)
+
+        self.assertEqual(Session.load(self.session.path).state, state_before)
 
 
 if __name__ == "__main__":

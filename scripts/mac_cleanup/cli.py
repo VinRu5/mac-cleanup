@@ -8,11 +8,12 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 
 from .admin_script import generate_admin_script, import_admin_results
 from .executor import BatchOutcome, apply_batch, verify_batch
 from .manifests import approval_digest, approve_batch, build_manifest
-from .models import Batch, Issue, Severity, Target
+from .models import Batch, Issue, Severity, Target, TargetStatus
 from .modules.base import ScanContext, ScanResult
 from .modules.registry import registered_modules
 from .process import ProcessRunner, ToolResolver
@@ -90,53 +91,58 @@ def main(
 
 def _scan(session_path: Path, home: Path) -> int:
     session = Session.load(session_path) if (session_path / "state.json").exists() else Session.create(session_path)
-    if session.policy_path.exists():
-        policy = session.read_policy()
-    else:
-        policy = dict(DEFAULT_POLICY)
-        session.write_policy(policy)
-    threshold = policy.get("deep_scan_threshold_bytes")
-    if type(threshold) is not int or threshold < 0:
-        raise ValueError("policy deep_scan_threshold_bytes must be a non-negative integer")
-    canonical_home = _canonical_home(home)
-    context = ScanContext(
-        home=canonical_home,
-        uid=os.getuid(),
-        runner=ProcessRunner(),
-        deep_scan_threshold=threshold,
-        timeout_seconds=5,
-    )
-    targets: dict[str, Target] = {}
-    issues: list[Issue] = []
-    executable_ids: set[str] = set()
-    modules: list[dict[str, object]] = []
-    resolver = ToolResolver()
-    for module in registered_modules():
-        detected = module.detect(context)
-        modules.append({"detected": detected, "id": module.id})
-        if not detected:
-            continue
-        fast = module.fast_scan(context)
-        issues.extend(fast.issues)
-        targets.update((target.id, target) for target in fast.targets)
-        deep = module.deep_scan(context, tuple(target.id for target in fast.targets))
-        issues.extend(deep.issues)
-        targets.update((target.id, target) for target in deep.targets)
-        executable_ids.update(deep.executable_target_ids)
-    inventory = {
-        "capabilities": {
-            "modules": modules,
-            "tools": [
-                {"available": resolver.resolve(name) is not None, "name": name}
-                for name in ("python3", "zsh")
+    with session.operation_lock():
+        if session.policy_path.exists():
+            policy = session.read_policy()
+        else:
+            policy = dict(DEFAULT_POLICY)
+            session.write_policy(policy)
+        threshold = policy.get("deep_scan_threshold_bytes")
+        if type(threshold) is not int or threshold < 0:
+            raise ValueError("policy deep_scan_threshold_bytes must be a non-negative integer")
+        canonical_home = _canonical_home(home)
+        context = ScanContext(
+            home=canonical_home,
+            uid=os.getuid(),
+            runner=ProcessRunner(),
+            deep_scan_threshold=threshold,
+            timeout_seconds=5,
+        )
+        targets: dict[str, Target] = {}
+        issues: list[Issue] = []
+        executable_ids: set[str] = set()
+        modules: list[dict[str, object]] = []
+        resolver = ToolResolver()
+        for module in registered_modules():
+            detected = module.detect(context)
+            modules.append({"detected": detected, "id": module.id})
+            if not detected:
+                continue
+            fast = module.fast_scan(context)
+            issues.extend(fast.issues)
+            targets.update((target.id, target) for target in fast.targets)
+            deep = module.deep_scan(context, tuple(target.id for target in fast.targets))
+            issues.extend(deep.issues)
+            targets.update((target.id, target) for target in deep.targets)
+            executable_ids.update(deep.executable_target_ids)
+        inventory = {
+            "capabilities": {
+                "modules": sorted(modules, key=lambda item: str(item["id"])),
+                "tools": [
+                    {"available": resolver.resolve(name) is not None, "name": name}
+                    for name in ("python3", "zsh")
+                ],
+            },
+            "executable_target_ids": sorted(executable_ids),
+            "issues": [issue.to_dict() for issue in sorted(issues, key=_issue_key)],
+            "schema_version": 1,
+            "targets": [
+                target.to_dict()
+                for target in sorted(targets.values(), key=lambda value: value.id)
             ],
-        },
-        "executable_target_ids": sorted(executable_ids),
-        "issues": [issue.to_dict() for issue in sorted(issues, key=_issue_key)],
-        "schema_version": 1,
-        "targets": [target.to_dict() for target in sorted(targets.values(), key=lambda value: value.id)],
-    }
-    session.write_inventory(inventory)
+        }
+        _scan_result(inventory)
+        session.write_inventory(inventory)
     _print_json(
         {
             "capabilities": inventory["capabilities"],
@@ -272,23 +278,127 @@ def _verify(session_path: Path, batch_id: str, home: Path) -> int:
 
 def _scan_result(value: Mapping[str, object]) -> ScanResult:
     expected = {"capabilities", "executable_target_ids", "issues", "schema_version", "targets"}
-    if set(value) != expected or value.get("schema_version") != 1:
+    if (
+        set(value) != expected
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+    ):
         raise ValueError("inventory fields do not match schema version 1")
     capabilities = value["capabilities"]
     targets = value["targets"]
     issues = value["issues"]
     executable = value["executable_target_ids"]
-    if not isinstance(capabilities, Mapping) or not isinstance(targets, list) or not isinstance(issues, list):
+    if (
+        not isinstance(capabilities, Mapping)
+        or set(capabilities) != {"modules", "tools"}
+        or not isinstance(targets, list)
+        or not isinstance(issues, list)
+    ):
         raise ValueError("inventory is malformed")
-    if not isinstance(executable, list) or not all(isinstance(item, str) for item in executable):
+    modules = capabilities["modules"]
+    tools = capabilities["tools"]
+    _validate_capability_records(modules, {"detected", "id"}, "detected")
+    _validate_capability_records(tools, {"available", "name"}, "available")
+    if (
+        not isinstance(executable, list)
+        or not all(isinstance(item, str) and item for item in executable)
+        or executable != sorted(set(executable))
+    ):
         raise ValueError("inventory executable target ids are malformed")
     if not all(isinstance(item, Mapping) for item in targets + issues):
         raise ValueError("inventory targets or issues are malformed")
+    parsed_targets: list[Target] = []
+    seen_ids: set[str] = set()
+    for item in targets:
+        if set(item) != {
+            "id",
+            "path",
+            "kind",
+            "risk",
+            "status",
+            "fingerprint",
+            "logical_bytes",
+        } or type(item["logical_bytes"]) is not int:
+            raise ValueError("inventory target does not match schema")
+        target = Target.from_dict(item)
+        if dict(item) != target.to_dict():
+            raise ValueError("inventory target does not match schema")
+        if (
+            not target.id
+            or target.id in seen_ids
+            or target.status is not TargetStatus.PENDING
+            or target.kind not in {"file", "directory"}
+            or type(target.logical_bytes) is not int
+            or target.logical_bytes < 0
+        ):
+            raise ValueError("inventory target fields are invalid")
+        prefix, separator, name = target.id.partition(":")
+        path = Path(target.path)
+        if (
+            not prefix
+            or not separator
+            or not name
+            or not path.is_absolute()
+            or ".." in path.parts
+            or path.resolve(strict=False) != path
+            or path.name != name
+            or any(character in target.path for character in ("\0", "\n", "\r"))
+        ):
+            raise ValueError("inventory target identity is invalid")
+        if target.fingerprint and not re.fullmatch(r"[0-9a-f]{64}", target.fingerprint):
+            raise ValueError("inventory target fingerprint is invalid")
+        seen_ids.add(target.id)
+        parsed_targets.append(target)
+    if [target.id for target in parsed_targets] != sorted(seen_ids):
+        raise ValueError("inventory targets are not sorted")
+    executable_ids = set(executable)
+    if not executable_ids.issubset(seen_ids):
+        raise ValueError("inventory executable ids name unknown targets")
+    if any(
+        not target.fingerprint
+        for target in parsed_targets
+        if target.id in executable_ids
+    ):
+        raise ValueError("inventory executable target is shallow")
+    parsed_issues: list[Issue] = []
+    for item in issues:
+        issue = Issue.from_dict(item)
+        if dict(item) != issue.to_dict() or not issue.code or not issue.message:
+            raise ValueError("inventory issue does not match schema")
+        if issue.target_id is not None and (
+            not isinstance(issue.target_id, str) or not issue.target_id
+        ):
+            raise ValueError("inventory issue target id is invalid")
+        parsed_issues.append(issue)
+    if parsed_issues != sorted(parsed_issues, key=_issue_key):
+        raise ValueError("inventory issues are not sorted")
     return ScanResult(
-        targets=tuple(Target.from_dict(item) for item in targets),
-        issues=tuple(Issue.from_dict(item) for item in issues),
+        targets=tuple(parsed_targets),
+        issues=tuple(parsed_issues),
         executable_target_ids=tuple(executable),
     )
+
+
+def _validate_capability_records(
+    value: object, fields: set[str], boolean_field: str
+) -> None:
+    if not isinstance(value, list):
+        raise ValueError("inventory capabilities must be lists")
+    name_field = "id" if "id" in fields else "name"
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != fields:
+            raise ValueError("inventory capability does not match schema")
+        name = item[name_field]
+        if (
+            not isinstance(name, str)
+            or not name
+            or type(item[boolean_field]) is not bool
+        ):
+            raise ValueError("inventory capability fields are invalid")
+        names.append(name)
+    if names != sorted(set(names)):
+        raise ValueError("inventory capabilities are not sorted and unique")
 
 
 def _named_batch(session: Session, batch_id: str) -> Batch:

@@ -318,19 +318,26 @@ def validate_admin_artifacts(
     batch_id: str,
     *,
     trusted_home: Path | None = None,
+    require_approved: bool = True,
 ) -> AdminArtifactValidation:
     """Validate the exact authorized artifacts immediately before manual use.
 
     This read-only engine check holds the stable session lock while validating the
     durable binding, current script and snapshot bytes, metadata, manifest, batch,
-    approvals, trusted root, and critical latch.  The caller must present and the
-    human must confirm ``checksum`` and execute that exact script.  This check does
-    not close the later manual-execution time gap against a malicious same-UID actor.
+    lifecycle authorization, trusted root, and critical latch.  The default mode
+    requires every target to remain approved before manual use.  Reporting passes
+    ``require_approved=False`` to audit integrity after later lifecycle transitions;
+    that read-only mode does not authorize execution.  The caller must present and
+    the human must confirm ``checksum`` and execute that exact script.  This check
+    does not close the later manual-execution time gap against a malicious same-UID
+    actor.
     """
     if not isinstance(session, Session):
         raise TypeError("session must be a Session")
     if not isinstance(batch_id, str) or not batch_id:
         raise ValueError("administrative batch id must be non-empty text")
+    if type(require_approved) is not bool:
+        raise TypeError("require_approved must be boolean")
     allowed_root = _trusted_cache_root(_trusted_home(trusted_home))
 
     with session.operation_lock():
@@ -395,7 +402,12 @@ def validate_admin_artifacts(
             0o600,
         )
 
-        persisted = _approved_session_batch(session, _named_batch(session, batch_id))
+        named = _named_batch(session, batch_id)
+        persisted = (
+            _approved_session_batch(session, named)
+            if require_approved
+            else named
+        )
         _validate_batch_location(persisted, allowed_root)
         manifest_digest = _manifest_digest(session)
         expected_operation = _operation_digest(
