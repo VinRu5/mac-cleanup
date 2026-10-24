@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import json
 import io
+import os
 import runpy
 import copy
 import threading
@@ -297,11 +298,18 @@ class CliTest(unittest.TestCase):
             valid = read_json(outcomes_path)
             mutations = {
                 "forged delta": lambda item: item.update(free_space_delta=4_000_000),
+                "dry run with removal": lambda item: item.update(dry_run=True),
+                "dry run without removal": lambda item: item.update(
+                    dry_run=True,
+                    logical_bytes_removed=0,
+                    logical_bytes_removed_by_target=[],
+                ),
                 "reversed issues": lambda item: item["issues"].reverse(),
                 "duplicate issue": lambda item: item["issues"].append(
                     copy.deepcopy(item["issues"][0])
                 ),
             }
+            session.write_report("sentinel report\n")
             for label, mutate in mutations.items():
                 with self.subTest(label=label):
                     document = copy.deepcopy(valid)
@@ -314,7 +322,189 @@ class CliTest(unittest.TestCase):
 
                     self.assertEqual(code, 2)
                     self.assertEqual(output, "")
-                    self.assertFalse(session.report_path.exists())
+                    self.assertEqual(
+                        session.report_path.read_text(encoding="utf-8"),
+                        "sentinel report\n",
+                    )
+
+    def test_lock_replacement_before_outcome_read_latches_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "pre-read"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"keep")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:pre-read",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            from scripts.mac_cleanup.reporting import (
+                record_batch_outcome,
+                validate_outcome_history as real_validate,
+            )
+
+            record_batch_outcome(
+                session,
+                "apply",
+                BatchOutcome(batch_id=batch.id),
+            )
+            outcomes_path = session.path / "outcomes.json"
+            outcomes_before = outcomes_path.read_bytes()
+            state_before = session.state
+
+            def replace_lock_then_validate(current: Session) -> None:
+                replacement = current.path / ".replacement.lock"
+                replacement.write_bytes(b"")
+                os.chmod(replacement, 0o600)
+                os.replace(replacement, current.lock_path)
+                real_validate(current)
+
+            with patch(
+                "scripts.mac_cleanup.cli.validate_outcome_history",
+                side_effect=replace_lock_then_validate,
+            ):
+                code, output = self._run(
+                    ["apply", "--session", str(session.path), "--batch", batch.id],
+                    trusted_home=home,
+                )
+
+            resumed = Session.load(session.path)
+            self.assertEqual(code, 4)
+            self.assertEqual(
+                json.loads(output)["critical_issue"]["code"],
+                "reporting.accounting-lock-lost",
+            )
+            self.assertTrue(target_path.exists())
+            self.assertEqual(resumed.status(target.id), "approved")
+            self.assertEqual(resumed.state["events"], state_before["events"])
+            self.assertEqual(outcomes_path.read_bytes(), outcomes_before)
+            self.assertEqual(
+                resumed.critical_issue().code,
+                "reporting.accounting-lock-lost",
+            )
+
+    def test_lock_replacement_after_apply_latches_and_never_trusts_forged_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            cache_root.mkdir(parents=True)
+            targets: list[Target] = []
+            for name, risk in (
+                ("removed", Risk.SAFE_REGENERABLE),
+                ("future", Risk.REVIEW_REQUIRED),
+            ):
+                path = cache_root / name
+                path.mkdir()
+                (path / "entry.bin").write_bytes(b"cache")
+                identity = inspect_path(path, (cache_root,))
+                targets.append(
+                    Target(
+                        id=f"user-caches:{name}",
+                        path=identity.canonical,
+                        kind=identity.kind,
+                        risk=risk,
+                        fingerprint=identity.fingerprint,
+                        logical_bytes=identity.logical_bytes,
+                    )
+                )
+            safe_batch = Batch("safe-user-caches", (targets[0],))
+            future_batch = Batch("review-user-caches", (targets[1],))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(
+                    batches=(safe_batch, future_batch),
+                    inventory_digest="a" * 64,
+                )
+            )
+            for target in targets:
+                session.transition(target.id, "approved")
+            outcomes_path = session.path / "outcomes.json"
+            forged = b'{"operations":[{"forged":true}],"schema_version":1}'
+            replaced = False
+
+            def publish_then_replace(path: str | Path, value: object) -> None:
+                nonlocal replaced
+                atomic_write_json(path, value)
+                if Path(path) == outcomes_path and not replaced:
+                    replaced = True
+                    replacement = session.path / ".replacement.lock"
+                    replacement.write_bytes(b"")
+                    os.chmod(replacement, 0o600)
+                    os.replace(replacement, session.lock_path)
+                    outcomes_path.write_bytes(forged)
+                    os.chmod(outcomes_path, 0o600)
+
+            with patch(
+                "scripts.mac_cleanup.reporting.atomic_write_json",
+                side_effect=publish_then_replace,
+            ):
+                code, output = self._run(
+                    [
+                        "apply",
+                        "--session",
+                        str(session.path),
+                        "--batch",
+                        safe_batch.id,
+                    ],
+                    trusted_home=home,
+                )
+
+            resumed = Session.load(session.path)
+            self.assertTrue(replaced)
+            self.assertEqual(code, 4)
+            self.assertEqual(
+                json.loads(output)["critical_issue"]["code"],
+                "reporting.accounting-lock-lost",
+            )
+            self.assertFalse(Path(targets[0].path).exists())
+            self.assertEqual(resumed.status(targets[0].id), "verified")
+            self.assertEqual(resumed.status(targets[1].id), "approved")
+            self.assertEqual(outcomes_path.read_bytes(), forged)
+            self.assertEqual(
+                resumed.critical_issue().code,
+                "reporting.accounting-lock-lost",
+            )
+
+            for command in ("apply", "verify"):
+                future_code, _ = self._run(
+                    [
+                        command,
+                        "--session",
+                        str(session.path),
+                        "--batch",
+                        future_batch.id,
+                    ],
+                    trusted_home=home,
+                )
+                self.assertEqual(future_code, 4)
+                self.assertTrue(Path(targets[1].path).exists())
+                self.assertEqual(
+                    Session.load(session.path).status(targets[1].id),
+                    "approved",
+                )
+
+            report_code, report_path = self._run(
+                ["report", "--session", str(session.path)], trusted_home=home
+            )
+            self.assertEqual(report_code, 0)
+            report = Path(report_path).read_text(encoding="utf-8")
+            self.assertIn("reporting.accounting-lock-lost", report)
+            self.assertIn("Removed logical bytes: unknown", report)
+            self.assertNotIn("forged", report)
+            self.assertEqual(outcomes_path.read_bytes(), forged)
 
     def test_apply_and_verify_reject_existing_forged_outcomes_before_mutation(self) -> None:
         for command, dry_run in (("apply", False), ("apply", True), ("verify", False)):

@@ -199,3 +199,61 @@ concurrent forged history was accepted after lock ordering.
   resolution errors to invalid input rather than exposing runtime exceptions.
 - Confirmed tests use only temporary trusted-home fixtures; production paths are not
   scanned or deleted, and `progress.md` remains unchanged.
+
+## Fix round 3
+
+Status: DONE
+
+### Review findings addressed
+
+- Every outcome-history read now asserts that the session lock pathname still names
+  the inode held by the operation immediately before reading. Outcome publication
+  asserts that identity immediately before and after the atomic write.
+- Any accounting lock-identity loss is a critical safety failure. Apply, verify, and
+  report unwind the stale lock context, reacquire the current stable lock, reload
+  durable state without reading outcomes, and persist `reporting.accounting-lock-lost`.
+  The CLI returns code `4` and never reports success for the interrupted operation.
+- Pre-mutation detection leaves target contents, lifecycle, and outcomes unchanged
+  except for the durable global safety latch. Post-mutation detection explicitly
+  records that filesystem rollback is impossible and removed-logical accounting is
+  unknown. The recovery path never repairs, normalizes, or trusts competing outcome
+  bytes.
+- Future apply/verify commands short-circuit on the durable latch before reading a
+  forged outcomes artifact. Reporting also ignores all outcome bytes under this latch,
+  renders removed logical bytes as `unknown`, and surfaces the critical issue.
+- Persisted outcome operations now require `dry_run` to be exactly `false`.
+  `record_batch_outcome` rejects dry-run outcomes, including zero and nonzero removal
+  claims, before locking or creating an artifact.
+- The recovery remains within the cooperative threat boundary: engine participants
+  honor `Session.operation_lock`; pathname replacement is detected at the explicit
+  checkpoints, while no claim is made to defeat an unrestricted malicious same-UID
+  actor between arbitrary syscalls.
+
+### RED evidence
+
+`python3 -m unittest tests.test_reporting tests.test_cli`
+
+Initial result: 8 failures. Dry-run records were persisted and rendered; pre-read lock
+replacement returned code `2` without a durable stop; post-publication replacement
+returned success while a malformed competing outcomes document remained; subsequent
+commands did not return the required critical-stop status.
+
+### GREEN evidence
+
+- `python3 -m unittest tests.test_reporting tests.test_cli` — 28 tests passed.
+- `python3 -m unittest discover -s tests -v` — 129 tests passed.
+- `python3 -m py_compile scripts/mac_cleanup.py scripts/mac_cleanup/*.py scripts/mac_cleanup/modules/*.py tests/*.py`
+  — passed.
+- `git diff --check` — passed.
+
+### Fix-round self-review
+
+- Confirmed stale-lock recovery begins only after the stale context unwinds, so it
+  acquires and validates the currently named lock inode before persisting the latch.
+- Confirmed state persistence retains Task 6's first-critical-stop rule; if another
+  critical stop already exists, accounting-lock loss is still durably added as a
+  critical issue and recognized by future command/report guards.
+- Confirmed a safely completed removal cannot be rolled back; the durable stop and
+  unknown accounting presentation are intentionally conservative.
+- Confirmed no authorization validator was duplicated, all new tests use temporary
+  trusted-home fixtures, and `progress.md` remains unchanged.

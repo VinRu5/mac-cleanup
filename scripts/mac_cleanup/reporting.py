@@ -10,15 +10,35 @@ from .admin_script import AdminArtifactValidation, validate_admin_artifacts
 from .executor import BatchOutcome
 from .jsonio import atomic_write_json, read_json
 from .models import Issue, Manifest, Severity
-from .sessions import Session
+from .sessions import Session, SessionConsistencyError
 
 
 OUTCOMES_SCHEMA_VERSION = 1
+ACCOUNTING_LOCK_LOST_CODE = "reporting.accounting-lock-lost"
 _SEVERITY_ORDER = tuple(severity.value for severity in Severity)
 
 
 class AdministrativeArtifactError(ValueError):
     """Raised when a bound manual artifact fails the Task 9 engine validator."""
+
+
+class OutcomeLockIdentityError(SessionConsistencyError):
+    """Raised when accounting no longer owns the current session-lock inode."""
+
+
+def accounting_lock_loss_issue(state: Mapping[str, object]) -> Issue | None:
+    """Return the durable accounting-lock stop without consulting outcomes."""
+    candidates: list[object] = [state.get("critical_stop")]
+    issues = state.get("issues", [])
+    if isinstance(issues, list):
+        candidates.extend(reversed(issues))
+    for value in candidates:
+        if not isinstance(value, Mapping):
+            continue
+        issue = Issue.from_dict(value)
+        if issue.code == ACCOUNTING_LOCK_LOST_CODE:
+            return issue
+    return None
 
 
 def validate_outcome_history(session: Session) -> None:
@@ -27,12 +47,7 @@ def validate_outcome_history(session: Session) -> None:
         raise TypeError("session must be a Session")
     with session.operation_lock():
         manifest = session.read_manifest()
-        path = _outcomes_path(session)
-        document = (
-            _read_outcomes(path)
-            if path.exists()
-            else {"schema_version": OUTCOMES_SCHEMA_VERSION, "operations": []}
-        )
+        document = _read_outcome_document(session)
         operations = document["operations"]
         assert isinstance(operations, list)
         _validate_operations_membership(manifest, operations)
@@ -46,21 +61,21 @@ def record_batch_outcome(
         raise ValueError("outcome operation must be apply or verify")
     if not isinstance(outcome, BatchOutcome):
         raise TypeError("outcome must be a BatchOutcome")
+    if outcome.dry_run is not False:
+        raise ValueError("dry-run outcomes must never be persisted")
     with session.operation_lock():
         manifest = session.read_manifest()
         _validate_outcome_membership(manifest, outcome)
         path = _outcomes_path(session)
-        document = (
-            _read_outcomes(path)
-            if path.exists()
-            else {"schema_version": OUTCOMES_SCHEMA_VERSION, "operations": []}
-        )
+        document = _read_outcome_document(session)
         operations = document["operations"]
         assert isinstance(operations, list)
         value = _outcome_value(len(operations) + 1, operation, outcome)
         _validate_outcome(value, len(operations) + 1)
         operations.append(value)
+        _assert_outcome_lock_current(session)
         atomic_write_json(path, document)
+        _assert_outcome_lock_current(session)
 
 
 def render_report(
@@ -74,8 +89,12 @@ def render_report(
 def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
     manifest = session.read_manifest()
     state = session.state
-    outcomes_path = _outcomes_path(session)
-    outcomes = _read_outcomes(outcomes_path)["operations"] if outcomes_path.exists() else []
+    accounting_lost = accounting_lock_loss_issue(state)
+    outcomes = (
+        []
+        if accounting_lost is not None
+        else _read_outcome_document(session)["operations"]
+    )
     assert isinstance(outcomes, list)
     _validate_operations_membership(manifest, outcomes)
     validations = _admin_validations(session, manifest, state, trusted_home)
@@ -169,6 +188,25 @@ def _outcomes_path(session: Session) -> Path:
     return session.path / "outcomes.json"
 
 
+def _assert_outcome_lock_current(session: Session) -> None:
+    try:
+        session.assert_operation_lock_current()
+    except SessionConsistencyError as error:
+        raise OutcomeLockIdentityError(
+            "session lock identity changed during outcome accounting"
+        ) from error
+
+
+def _read_outcome_document(session: Session) -> dict[str, object]:
+    """Read only while the path still names this operation's locked inode."""
+    _assert_outcome_lock_current(session)
+    path = _outcomes_path(session)
+    if not path.exists():
+        return {"schema_version": OUTCOMES_SCHEMA_VERSION, "operations": []}
+    _assert_outcome_lock_current(session)
+    return _read_outcomes(path)
+
+
 def _outcome_value(
     sequence: int, operation: str, outcome: BatchOutcome
 ) -> dict[str, object]:
@@ -232,9 +270,10 @@ def _validate_outcome(value: object, sequence: int) -> None:
         raise ValueError("outcome operation is invalid")
     if not isinstance(value["batch_id"], str) or not value["batch_id"]:
         raise ValueError("outcome batch id is invalid")
-    for key in ("dry_run", "suspended"):
-        if type(value[key]) is not bool:
-            raise ValueError("outcome boolean is invalid")
+    if value["dry_run"] is not False:
+        raise ValueError("persisted outcomes must not be dry runs")
+    if type(value["suspended"]) is not bool:
+        raise ValueError("outcome boolean is invalid")
     for key in ("logical_bytes_removed", "regenerated_bytes"):
         if type(value[key]) is not int or value[key] < 0:
             raise ValueError("outcome byte count is invalid")

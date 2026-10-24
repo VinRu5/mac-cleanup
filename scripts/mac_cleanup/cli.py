@@ -18,12 +18,15 @@ from .modules.base import ScanContext, ScanResult
 from .modules.registry import registered_modules
 from .process import ProcessRunner, ToolResolver
 from .reporting import (
+    ACCOUNTING_LOCK_LOST_CODE,
     AdministrativeArtifactError,
+    OutcomeLockIdentityError,
+    accounting_lock_loss_issue,
     record_batch_outcome,
     render_report,
     validate_outcome_history,
 )
-from .sessions import InvalidTransition, Session
+from .sessions import InvalidTransition, Session, SessionConsistencyError
 
 
 COMMANDS = ("scan", "plan", "approve", "apply", "verify", "report")
@@ -77,12 +80,7 @@ def main(
         if args.command == "verify":
             return _verify(Path(args.session), args.batch, home)
         if args.command == "report":
-            session = Session.load(args.session)
-            with session.operation_lock():
-                report = render_report(session, trusted_home=home)
-                session.write_report(report)
-            print(session.report_path)
-            return SUCCESS
+            return _report(Path(args.session), home)
     except AdministrativeArtifactError:
         return CRITICAL_SAFETY_FAILURE
     except (FileNotFoundError, InvalidTransition, KeyError, OSError, TypeError, ValueError):
@@ -185,99 +183,204 @@ def _plan(session_path: Path) -> int:
 
 def _apply(session_path: Path, batch_id: str, dry_run: bool, home: Path) -> int:
     session = Session.load(session_path)
-    with session.operation_lock():
-        validate_outcome_history(session)
-        batch = _named_batch(session, batch_id)
-        roots = _trusted_allowed_roots(batch, _canonical_home(home))
-        if dry_run:
-            outcome = apply_batch(session, batch, roots, dry_run=True)
-            _print_json(_outcome_summary("apply", outcome))
-            return _outcome_exit(outcome)
+    mutation_may_have_completed = False
+    try:
+        with session.operation_lock():
+            existing = accounting_lock_loss_issue(session.state)
+            if existing is not None:
+                return _critical_accounting_stop("apply", batch_id, existing)
+            validate_outcome_history(session)
+            batch = _named_batch(session, batch_id)
+            roots = _trusted_allowed_roots(batch, _canonical_home(home))
+            if dry_run:
+                outcome = apply_batch(session, batch, roots, dry_run=True)
+                session.assert_operation_lock_current()
+                _print_json(_outcome_summary("apply", outcome))
+                return _outcome_exit(outcome)
 
-        preview = apply_batch(session, batch, roots, dry_run=True)
-        if _administrative_fallback_required(preview):
-            script_path = session.path / f"admin-{batch.id}.zsh"
-            result_path = session.path / f"admin-{batch.id}-result.json"
-            try:
-                checksum = generate_admin_script(
-                    batch,
-                    script_path,
-                    result_path,
-                    trusted_home=home,
-                )
-            except (OSError, TypeError, ValueError):
+            preview = apply_batch(session, batch, roots, dry_run=True)
+            session.assert_operation_lock_current()
+            if _administrative_fallback_required(preview):
+                script_path = session.path / f"admin-{batch.id}.zsh"
+                result_path = session.path / f"admin-{batch.id}-result.json"
+                mutation_may_have_completed = True
+                try:
+                    checksum = generate_admin_script(
+                        batch,
+                        script_path,
+                        result_path,
+                        trusted_home=home,
+                    )
+                except SessionConsistencyError:
+                    raise
+                except (OSError, TypeError, ValueError):
+                    _print_json(
+                        {
+                            "batch_id": batch.id,
+                            "command": "apply",
+                            "critical_issue": "administrative artifact validation failed",
+                        }
+                    )
+                    return CRITICAL_SAFETY_FAILURE
+                session.assert_operation_lock_current()
                 _print_json(
                     {
                         "batch_id": batch.id,
+                        "checksum": checksum,
                         "command": "apply",
-                        "critical_issue": "administrative artifact validation failed",
+                        "manual_precondition": (
+                            "Execute exactly the engine-validated script path, not a copy or "
+                            "replacement, only after confirming this checksum. Validation does not "
+                            "close the later same-UID manual execution gap."
+                        ),
+                        "result_path": str(result_path),
+                        "script_path": str(script_path),
+                        "status": "administrative_fallback_required",
                     }
                 )
-                return CRITICAL_SAFETY_FAILURE
-            _print_json(
-                {
-                    "batch_id": batch.id,
-                    "checksum": checksum,
-                    "command": "apply",
-                    "manual_precondition": (
-                        "Execute exactly the engine-validated script path, not a copy or "
-                        "replacement, only after confirming this checksum. Validation does not "
-                        "close the later same-UID manual execution gap."
-                    ),
-                    "result_path": str(result_path),
-                    "script_path": str(script_path),
-                    "status": "administrative_fallback_required",
-                }
-            )
-            return BATCH_SUSPENDED
+                return BATCH_SUSPENDED
 
-        outcome = apply_batch(session, batch, roots)
-        record_batch_outcome(session, "apply", outcome)
-        _print_json(_outcome_summary("apply", outcome))
-        return _outcome_exit(outcome)
+            mutation_may_have_completed = True
+            outcome = apply_batch(session, batch, roots)
+            record_batch_outcome(session, "apply", outcome)
+            _print_json(_outcome_summary("apply", outcome))
+            return _outcome_exit(outcome)
+    except (OutcomeLockIdentityError, SessionConsistencyError):
+        return _recover_accounting_lock_loss(
+            session_path,
+            "apply",
+            batch_id,
+            mutation_may_have_completed=mutation_may_have_completed,
+        )
 
 
 def _verify(session_path: Path, batch_id: str, home: Path) -> int:
     session = Session.load(session_path)
-    with session.operation_lock():
-        validate_outcome_history(session)
-        binding = session.admin_script_binding(batch_id)
-        if binding is not None:
-            result_path = binding.get("result_path")
-            checksum = binding.get("checksum")
-            if not isinstance(result_path, str) or not isinstance(checksum, str):
-                raise ValueError("administrative binding is malformed")
-            try:
-                import_admin_results(
-                    session,
-                    result_path,
-                    checksum,
-                    trusted_home=home,
-                )
-            except (OSError, TypeError, ValueError):
-                _print_json(
-                    {
-                        "batch_id": batch_id,
-                        "command": "verify",
-                        "critical_issue": "administrative artifact validation failed",
-                    }
-                )
-                return CRITICAL_SAFETY_FAILURE
-            critical = session.critical_issue()
-            if critical is not None:
-                _print_json({"batch_id": batch_id, "command": "verify", "critical_issue": critical.to_dict()})
-                return CRITICAL_SAFETY_FAILURE
+    mutation_may_have_completed = False
+    try:
+        with session.operation_lock():
+            existing = accounting_lock_loss_issue(session.state)
+            if existing is not None:
+                return _critical_accounting_stop("verify", batch_id, existing)
+            validate_outcome_history(session)
+            binding = session.admin_script_binding(batch_id)
+            if binding is not None:
+                result_path = binding.get("result_path")
+                checksum = binding.get("checksum")
+                if not isinstance(result_path, str) or not isinstance(checksum, str):
+                    raise ValueError("administrative binding is malformed")
+                mutation_may_have_completed = True
+                try:
+                    import_admin_results(
+                        session,
+                        result_path,
+                        checksum,
+                        trusted_home=home,
+                    )
+                except SessionConsistencyError:
+                    raise
+                except (OSError, TypeError, ValueError):
+                    _print_json(
+                        {
+                            "batch_id": batch_id,
+                            "command": "verify",
+                            "critical_issue": "administrative artifact validation failed",
+                        }
+                    )
+                    return CRITICAL_SAFETY_FAILURE
+                session.assert_operation_lock_current()
+                critical = session.critical_issue()
+                if critical is not None:
+                    _print_json({"batch_id": batch_id, "command": "verify", "critical_issue": critical.to_dict()})
+                    return CRITICAL_SAFETY_FAILURE
+                batch = _named_batch(session, batch_id)
+                statuses = tuple(session.status(target.id) for target in batch.targets)
+                if any(status == "suspended" for status in statuses):
+                    _print_json({"batch_id": batch_id, "command": "verify", "status": "suspended"})
+                    return BATCH_SUSPENDED
             batch = _named_batch(session, batch_id)
-            statuses = tuple(session.status(target.id) for target in batch.targets)
-            if any(status == "suspended" for status in statuses):
-                _print_json({"batch_id": batch_id, "command": "verify", "status": "suspended"})
-                return BATCH_SUSPENDED
-        batch = _named_batch(session, batch_id)
-        roots = _trusted_allowed_roots(batch, _canonical_home(home))
-        outcome = verify_batch(session, batch, roots)
-        record_batch_outcome(session, "verify", outcome)
-        _print_json(_outcome_summary("verify", outcome))
-        return _outcome_exit(outcome)
+            roots = _trusted_allowed_roots(batch, _canonical_home(home))
+            mutation_may_have_completed = True
+            outcome = verify_batch(session, batch, roots)
+            record_batch_outcome(session, "verify", outcome)
+            _print_json(_outcome_summary("verify", outcome))
+            return _outcome_exit(outcome)
+    except (OutcomeLockIdentityError, SessionConsistencyError):
+        return _recover_accounting_lock_loss(
+            session_path,
+            "verify",
+            batch_id,
+            mutation_may_have_completed=mutation_may_have_completed,
+        )
+
+
+def _report(session_path: Path, home: Path) -> int:
+    session = Session.load(session_path)
+    try:
+        with session.operation_lock():
+            report = render_report(session, trusted_home=home)
+            session.assert_operation_lock_current()
+            session.write_report(report)
+            session.assert_operation_lock_current()
+        print(session.report_path)
+        return SUCCESS
+    except (OutcomeLockIdentityError, SessionConsistencyError):
+        return _recover_accounting_lock_loss(
+            session_path,
+            "report",
+            None,
+            mutation_may_have_completed=False,
+        )
+
+
+def _recover_accounting_lock_loss(
+    session_path: Path,
+    operation: str,
+    batch_id: str | None,
+    *,
+    mutation_may_have_completed: bool,
+) -> int:
+    """Reacquire the current lock and latch uncertainty without reading outcomes."""
+    recovered = Session.load(session_path)
+    with recovered.operation_lock():
+        issue = accounting_lock_loss_issue(recovered.state)
+        if issue is None:
+            if mutation_may_have_completed:
+                detail = (
+                    "Filesystem or lifecycle mutation may have completed; rollback is "
+                    "impossible and removed-logical accounting is unknown."
+                )
+            else:
+                detail = (
+                    "The loss was detected before cleanup mutation; target lifecycle and "
+                    "filesystem contents were not changed by this command."
+                )
+            scope = f" for batch {batch_id}" if batch_id is not None else ""
+            issue = Issue(
+                ACCOUNTING_LOCK_LOST_CODE,
+                Severity.CRITICAL,
+                f"Session lock identity changed during {operation}{scope}. "
+                f"{detail} Start a new session before any further cleanup.",
+            )
+            if recovered.critical_issue() is None:
+                recovered.latch_critical(issue)
+            else:
+                recovered.add_issue(issue)
+    return _critical_accounting_stop(operation, batch_id, issue)
+
+
+def _critical_accounting_stop(
+    operation: str, batch_id: str | None, issue: Issue
+) -> int:
+    value: dict[str, object] = {
+        "command": operation,
+        "critical_issue": issue.to_dict(),
+        "status": "critical_safety_stop",
+    }
+    if batch_id is not None:
+        value["batch_id"] = batch_id
+    _print_json(value)
+    return CRITICAL_SAFETY_FAILURE
 
 
 def _scan_result(value: Mapping[str, object]) -> ScanResult:

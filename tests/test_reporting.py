@@ -282,6 +282,37 @@ class ReportingTest(unittest.TestCase):
 
         self.assertEqual(Session.load(self.session.path).state, state_before)
 
+    def test_dry_run_outcomes_are_rejected_before_persistence(self) -> None:
+        target = Target(
+            id="user-caches:dry-run",
+            path=str(self.root / "home" / "Library" / "Caches" / "dry-run"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch("safe-user-caches", (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        for removed in (0, 5):
+            with self.subTest(removed=removed), self.assertRaises(ValueError):
+                record_batch_outcome(
+                    self.session,
+                    "apply",
+                    BatchOutcome(
+                        batch_id="safe-user-caches",
+                        logical_bytes_removed=removed,
+                        logical_bytes_removed_by_target=(
+                            ((target.id, removed),) if removed else ()
+                        ),
+                        dry_run=True,
+                    ),
+                )
+            self.assertFalse((self.session.path / "outcomes.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
