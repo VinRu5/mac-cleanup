@@ -14,7 +14,7 @@ class CleanupModule(Protocol):
     ) -> ScanResult: ...
 ```
 
-`ScanContext` is immutable and contains an absolute `home`, `uid`, `ProcessRunner`, deep-scan threshold, and timeout. `ScanResult` is immutable and contains sorted `targets`, `issues`, and `executable_target_ids`; only deep-scanned, fingerprinted executable targets can reach manifest approval.
+`ScanContext` is immutable and contains an absolute `home`, `uid`, `ProcessRunner`, deep-scan threshold, and timeout. `ScanResult` is immutable: its constructor sorts `targets` and de-duplicates/sorts `executable_target_ids`, but preserves supplied `issues` order. Emit issues in a deterministic order when a module needs deterministic output. Only deep-scanned, fingerprinted executable targets can reach manifest approval.
 
 Use a stable built-in registry sorted by module ID. Never dynamically load modules or accept a filesystem path as a module. Create deterministic target IDs as `<module-id>:<approved-immediate-name>`; the user-cache implementation uses `user-caches:<name>`, sorted by ID. IDs are selectors, not paths.
 

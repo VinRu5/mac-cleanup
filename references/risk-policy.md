@@ -19,6 +19,8 @@ The current module also excludes its cache root itself, `com.apple.*`, symlinks,
 | `informational` | Idempotent or expected observation, such as an already absent target or recreated cache. | Record and continue; an absent target verifies successfully. |
 | `warning` | Noncritical incomplete observation, such as an optional tool or unreadable candidate. | Record and continue only when safety is unchanged. |
 | `batch_error` | A target changed, is in use, lacks permission, or fails a noncritical postcondition. | Suspend the affected batch; do not mutate its remaining targets. Other batches may be considered independently. |
-| `critical` | A symlink/noncanonical/outside target, unapproved target, personal-data risk, or integrity failure. | Stop all mutation and return exit code `4`; start a new safe session only after resolving the condition. |
+| `critical` | A symlink/noncanonical/outside target, personal-data risk, or integrity failure. | Stop all mutation and return exit code `4`; start a new safe session only after resolving the condition. |
 
-Examples do not widen scope: a missing `zsh` is a warning; a fingerprint change is a batch error; a cache path replaced by a symlink is critical. Administrative fallback is only for engine-detected permission denial in an already approved batch, never a way to promote an excluded target.
+An unknown, unapproved, or otherwise non-approved batch/target submitted to `apply` or `verify` is invalid input: return exit code `2` without mutation. It is not a severity-classified critical stop.
+
+Examples do not widen scope: a fingerprint change is a batch error; a cache path replaced by a symlink is critical. Scan records tool capability availability (including `zsh`) but does not emit an Issue merely because a tool is unavailable. Administrative fallback is only for engine-detected permission denial in an already approved batch, never a way to promote an excluded target.

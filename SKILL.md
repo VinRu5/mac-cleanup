@@ -9,11 +9,11 @@ Use the bundled engine; do not replace it with shell cleanup, `rm`, package-mana
 
 ## Guided workflow
 
-1. Create or resume a durable session directory. Run `python3 scripts/mac_cleanup.py scan --session <session>`; scanning is read-only. Then run `plan` for that session.
+1. Create or resume a durable session directory. Run `python3 scripts/mac_cleanup.py scan --session <session>`; scanning is read-only. Then run `python3 scripts/mac_cleanup.py plan --session <session>`.
 2. Present the engine's exact batch IDs, target IDs and paths, risk class, exclusions/issues, privileges, and estimated **logical** bytes. Never describe that estimate as recovered disk space.
-3. Ask the human to approve one exact batch by its displayed SHA-256 digest. Do not infer approval from a general request to clean space. Run `approve --session <session> --batch <id> --digest <digest>` only after that approval.
-4. Run `apply --dry-run` for that same approved batch and show the result. Apply only that unchanged batch with `apply --batch <id>` after the human confirms proceeding. Never add paths, merge batches, or reuse a digest for a changed manifest.
-5. Treat a batch error as a suspension of that batch; independent batches remain available. Stop all mutation on a critical issue. Run `verify --batch <id>`, then `report`; use the persisted session to resume rather than repeating completed work.
+3. Ask the human to approve one exact batch by its displayed SHA-256 digest. Do not infer approval from a general request to clean space. Run `python3 scripts/mac_cleanup.py approve --session <session> --batch <id> --digest <digest>` only after that approval.
+4. Run `python3 scripts/mac_cleanup.py apply --session <session> --batch <id> --dry-run` for that same approved batch and show the result. Apply only that unchanged batch with `python3 scripts/mac_cleanup.py apply --session <session> --batch <id>` after the human confirms proceeding. Never add paths, merge batches, or reuse a digest for a changed manifest.
+5. Treat a batch error as a suspension of that batch; independent batches remain available. Stop all mutation on a critical issue. Run `python3 scripts/mac_cleanup.py verify --session <session> --batch <id>`, then `python3 scripts/mac_cleanup.py report --session <session>`; use the persisted session to resume rather than repeating completed work.
 
 The commands return `0` for success, `2` for invalid input (including a bad digest), `3` for a suspended batch, and `4` for a critical safety failure. Inspect the persisted report/state and resolve the recorded condition; do not bypass it.
 
