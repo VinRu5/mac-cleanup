@@ -137,8 +137,6 @@ def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
         )
         for target in sorted(batch.targets, key=lambda value: value.id):
             removed: str | int = removed_by_target.get(target.id, "unknown")
-            if target.id in absent_ids:
-                removed = "unknown"
             lines.append(
                 f"| `{target.id}` | {statuses.get(target.id, 'unknown')} | "
                 f"{target.logical_bytes} | {removed} |"
