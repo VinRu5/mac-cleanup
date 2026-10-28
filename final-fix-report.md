@@ -12,6 +12,10 @@
 - Accounting: interrupted exact removal persists an unknown aggregate plus explicit
   uncertain target ids and issue; known successful target counts remain available;
   strict durable validation and report rendering reject forged exact-zero records.
+- Post-removal checkpointing: failures while persisting `applied`, `verified`, or the
+  resulting critical stop are converted to a critical suspended outcome. The current
+  target remains accounting-unknown, completed earlier target counts are preserved,
+  and no speculative lifecycle transition or deletion retry is attempted.
 - Discovery: present but inaccessible cache roots remain detected and yield one
   `user-caches.cache-root-unavailable` warning; absent roots remain undetected.
 - Installation handoff: only `SKILL.md`, `agents/`, `references/`, `scripts/`, and
@@ -21,8 +25,11 @@
 ## Verification
 
 - Targeted final-finding suite: 84 tests passed before the final lock self-review.
-- Full suite after all changes: `python3 -m unittest discover -s tests` — 145 tests
+- Post-review focused suite: executor, CLI, reporting, and integration — 61 tests
   passed.
+- Full suite after all changes: `python3 -m unittest discover -s tests` — 149 tests
+  passed.
+- Integration suite: 2 tests passed.
 - Python compilation: all tracked Python files passed `py_compile`.
 - `git diff --check`: passed.
 - `quick_validate.py`: not runnable in the current interpreter because `PyYAML` is

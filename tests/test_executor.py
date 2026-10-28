@@ -424,6 +424,12 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(self.session.status(second.id), "suspended")
         self.assertFalse(Path(first.path).exists())
         self.assertTrue(Path(second.path).exists())
+        self.assertIsNone(outcome.logical_bytes_removed)
+        self.assertEqual(
+            outcome.logical_bytes_removed_by_target,
+            ((first.id, first.logical_bytes),),
+        )
+        self.assertEqual(outcome.uncertain_target_ids, (second.id,))
 
     def test_interrupted_exact_removal_marks_target_and_batch_accounting_unknown(self) -> None:
         target = self._target("cache-a", b"first")
@@ -461,6 +467,89 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(self.session.status(target.id), "suspended")
         self.assertIn(
             "executor.removal-accounting-uncertain",
+            {issue.code for issue in outcome.issues},
+        )
+
+    def test_applied_checkpoint_failure_after_removal_is_critical_and_unknown(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        real_transition = self.session.transition
+
+        def fail_applied(target_id: str, destination: str) -> None:
+            if destination == "applied":
+                raise OSError("simulated applied checkpoint failure")
+            real_transition(target_id, destination)
+
+        with patch.object(self.session, "transition", side_effect=fail_applied):
+            outcome = apply_batch(self.session, batch, (self.allowed_root,))
+
+        self.assertFalse(Path(target.path).exists())
+        self.assertTrue(outcome.suspended)
+        self.assertIsNone(outcome.logical_bytes_removed)
+        self.assertEqual(outcome.logical_bytes_removed_by_target, ())
+        self.assertEqual(outcome.uncertain_target_ids, (target.id,))
+        self.assertEqual(self.session.status(target.id), "approved")
+        self.assertEqual(
+            self.session.critical_issue().code,  # type: ignore[union-attr]
+            "executor.lifecycle-checkpoint-failed",
+        )
+        self.assertEqual(
+            {issue.code for issue in outcome.issues},
+            {
+                "executor.lifecycle-checkpoint-failed",
+                "executor.removal-accounting-uncertain",
+            },
+        )
+
+    def test_verified_checkpoint_failure_after_removal_is_critical_and_unknown(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        real_transition = self.session.transition
+
+        def fail_verified(target_id: str, destination: str) -> None:
+            if destination == "verified":
+                raise OSError("simulated verified checkpoint failure")
+            real_transition(target_id, destination)
+
+        with patch.object(self.session, "transition", side_effect=fail_verified):
+            outcome = apply_batch(self.session, batch, (self.allowed_root,))
+
+        self.assertFalse(Path(target.path).exists())
+        self.assertTrue(outcome.suspended)
+        self.assertIsNone(outcome.logical_bytes_removed)
+        self.assertEqual(outcome.logical_bytes_removed_by_target, ())
+        self.assertEqual(outcome.uncertain_target_ids, (target.id,))
+        self.assertEqual(self.session.status(target.id), "applied")
+        self.assertEqual(
+            self.session.critical_issue().code,  # type: ignore[union-attr]
+            "executor.lifecycle-checkpoint-failed",
+        )
+
+    def test_checkpoint_recovery_persistence_failure_still_returns_unknown(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+
+        with patch.object(
+            self.session,
+            "transition",
+            side_effect=OSError("simulated applied checkpoint failure"),
+        ), patch.object(
+            self.session,
+            "latch_critical",
+            side_effect=OSError("simulated critical latch failure"),
+        ):
+            outcome = apply_batch(self.session, batch, (self.allowed_root,))
+
+        self.assertFalse(Path(target.path).exists())
+        self.assertTrue(outcome.suspended)
+        self.assertIsNone(outcome.logical_bytes_removed)
+        self.assertEqual(outcome.logical_bytes_removed_by_target, ())
+        self.assertEqual(outcome.uncertain_target_ids, (target.id,))
+        self.assertIn(
+            "executor.lifecycle-checkpoint-failed",
             {issue.code for issue in outcome.issues},
         )
 

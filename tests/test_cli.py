@@ -284,6 +284,80 @@ class CliTest(unittest.TestCase):
             self.assertIn("Removed logical bytes: unknown", report)
             self.assertIn(f"Removal accounting uncertainty: `{target.id}`", report)
 
+    def test_removed_target_with_failed_applied_checkpoint_is_durable_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "checkpoint"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"cache")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:checkpoint",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            real_transition = Session.transition
+            failed = False
+
+            def fail_applied_once(
+                current: Session, target_id: str, destination: str
+            ) -> None:
+                nonlocal failed
+                if not failed and destination == "applied":
+                    failed = True
+                    raise OSError("simulated applied checkpoint failure")
+                real_transition(current, target_id, destination)
+
+            with patch.object(Session, "transition", new=fail_applied_once):
+                apply_code, apply_text = self._run(
+                    [
+                        "apply",
+                        "--session",
+                        str(session.path),
+                        "--batch",
+                        batch.id,
+                    ],
+                    trusted_home=home,
+                )
+
+            self.assertEqual(apply_code, 4)
+            summary = json.loads(apply_text)
+            self.assertEqual(summary["status"], "suspended")
+            self.assertIsNone(summary["logical_bytes_removed"])
+            self.assertEqual(summary["uncertain_target_ids"], [target.id])
+            self.assertFalse(target_path.exists())
+            resumed = Session.load(session.path)
+            self.assertEqual(resumed.status(target.id), "approved")
+            self.assertEqual(
+                resumed.critical_issue().code,  # type: ignore[union-attr]
+                "executor.lifecycle-checkpoint-failed",
+            )
+            operation = read_json(session.path / "outcomes.json")["operations"][0]
+            self.assertIsNone(operation["logical_bytes_removed"])
+            self.assertEqual(operation["uncertain_target_ids"], [target.id])
+
+            report_code, report_path = self._run(
+                ["report", "--session", str(session.path)], trusted_home=home
+            )
+
+            self.assertEqual(report_code, 0)
+            report = Path(report_path).read_text(encoding="utf-8")
+            self.assertIn("Removed logical bytes: unknown", report)
+            self.assertIn(f"Removal accounting uncertainty: `{target.id}`", report)
+            self.assertIn("`executor.lifecycle-checkpoint-failed`", report)
+            self.assertIn("`executor.removal-accounting-uncertain`", report)
+
     def test_cli_rejects_fingerprinted_user_cache_outside_trusted_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

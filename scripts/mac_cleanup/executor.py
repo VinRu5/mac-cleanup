@@ -145,11 +145,9 @@ def _apply_batch_locked(
             break
 
         assert result.identity is not None
+        session.assert_operation_lock_current()
         try:
-            session.assert_operation_lock_current()
             target_removed = remove_tree_exact(result.identity, roots)
-            removed += target_removed
-            removed_by_target.append((result.target.id, target_removed))
         except PathSafetyError as error:
             runtime_issues.append(_issue_from_safety_error(result.target, error))
             runtime_issues.append(_removal_accounting_issue(result.target))
@@ -166,22 +164,55 @@ def _apply_batch_locked(
             uncertain_target_ids.append(result.target.id)
             break
 
-        session.transition(result.target.id, "applied")
-        verification_issue = _absence_issue(result.target, roots)
-        if verification_issue is None:
-            session.transition(result.target.id, "verified")
-        else:
+        try:
+            session.transition(result.target.id, "applied")
+            verification_issue = _absence_issue(result.target, roots)
+            if verification_issue is None:
+                session.transition(result.target.id, "verified")
+        except PathSafetyError as error:
+            runtime_issues.append(_issue_from_safety_error(result.target, error))
+            runtime_issues.append(_removal_accounting_issue(result.target))
+            uncertain_target_ids.append(result.target.id)
+            break
+        except Exception as error:
+            runtime_issues.append(_lifecycle_checkpoint_issue(result.target, error))
+            runtime_issues.append(_removal_accounting_issue(result.target))
+            uncertain_target_ids.append(result.target.id)
+            break
+
+        removed += target_removed
+        removed_by_target.append((result.target.id, target_removed))
+        if verification_issue is not None:
             runtime_issues.append(verification_issue)
             break
 
     after = _free_space(roots, persisted)
     if runtime_issues:
         runtime = tuple(runtime_issues)
-        if _has_severity(runtime, Severity.CRITICAL):
-            _latch_first_critical(session, runtime)
-        else:
-            _record_new_issues(session, runtime)
-            _suspend_mutable_targets(session, persisted)
+        try:
+            if _has_severity(runtime, Severity.CRITICAL):
+                _latch_first_critical(session, runtime)
+            else:
+                _record_new_issues(session, runtime)
+                _suspend_mutable_targets(session, persisted)
+        except PathSafetyError as error:
+            runtime_issues.append(_issue_from_safety_error(result.target, error))
+            runtime = _mark_checkpoint_accounting_uncertain(
+                result.target,
+                runtime_issues,
+                uncertain_target_ids,
+                removed_by_target,
+            )
+            removed = sum(count for _, count in removed_by_target)
+        except Exception as error:
+            runtime_issues.append(_lifecycle_checkpoint_issue(result.target, error))
+            runtime = _mark_checkpoint_accounting_uncertain(
+                result.target,
+                runtime_issues,
+                uncertain_target_ids,
+                removed_by_target,
+            )
+            removed = sum(count for _, count in removed_by_target)
         return BatchOutcome(
             batch_id=persisted.id,
             issues=issues + runtime,
@@ -571,6 +602,36 @@ def _removal_accounting_issue(target: Target) -> Issue:
         f"are unknown for target: {target.path}",
         target.id,
     )
+
+
+def _lifecycle_checkpoint_issue(target: Target, error: BaseException) -> Issue:
+    return Issue(
+        "executor.lifecycle-checkpoint-failed",
+        Severity.CRITICAL,
+        "Durable lifecycle checkpoint failed after removal; session state may not "
+        f"match the filesystem for target: {target.path}: {error}",
+        target.id,
+    )
+
+
+def _mark_checkpoint_accounting_uncertain(
+    target: Target,
+    runtime_issues: list[Issue],
+    uncertain_target_ids: list[str],
+    removed_by_target: list[tuple[str, int]],
+) -> tuple[Issue, ...]:
+    if target.id not in uncertain_target_ids:
+        uncertain_target_ids.append(target.id)
+    removed_by_target[:] = [
+        item for item in removed_by_target if item[0] != target.id
+    ]
+    if not any(
+        issue.code == "executor.removal-accounting-uncertain"
+        and issue.target_id == target.id
+        for issue in runtime_issues
+    ):
+        runtime_issues.append(_removal_accounting_issue(target))
+    return tuple(runtime_issues)
 
 
 def _in_use_issue(target: Target, error: BaseException) -> Issue:
