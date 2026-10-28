@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 from scripts.mac_cleanup.jsonio import atomic_write_json, read_json
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Severity, Target
-from scripts.mac_cleanup.sessions import InvalidTransition, Session
+from scripts.mac_cleanup.sessions import (
+    InvalidTransition,
+    Session,
+    _open_lock_file,
+    _same_lock_inode,
+)
 
 
 def _fork_inside_session_lock_and_exit(
@@ -62,7 +67,8 @@ def _load_session_after_reporting_lock_attempt(
 class SessionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
-        self.session_path = Path(self.directory.name) / "session"
+        self.root = Path(self.directory.name).resolve()
+        self.session_path = self.root / "session"
         self.target = Target(
             id="cache-a",
             path="/private/tmp/cache-a",
@@ -98,6 +104,123 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(session.state["issues"][0]["code"], "OPTIONAL_TOOL_MISSING")
         for artifact in ("inventory.json", "policy.json", "manifest.json", "state.json"):
             self.assertEqual(os.stat(self.session_path / artifact).st_mode & 0o777, 0o600)
+
+    def test_create_rejects_noncanonical_or_symlinked_session_paths_before_writing(self) -> None:
+        real_parent = self.root / "real-parent"
+        real_parent.mkdir(mode=0o700)
+        linked_parent = self.root / "linked-parent"
+        os.symlink(real_parent, linked_parent)
+        targets = (
+            Path(str(self.root).replace("/private/var/", "/var/", 1)) / "alias-session",
+            linked_parent / "session",
+        )
+
+        for target in targets:
+            with self.subTest(target=target), self.assertRaises(
+                (OSError, ValueError)
+            ):
+                Session.create(target)
+
+        self.assertEqual(list(real_parent.iterdir()), [])
+
+    def test_create_rejects_unsafe_existing_directory_without_chmod_or_state_write(self) -> None:
+        unsafe = self.root / "unsafe-session"
+        unsafe.mkdir(mode=0o755)
+        sentinel = unsafe / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            Session.create(unsafe)
+
+        self.assertEqual(os.stat(unsafe).st_mode & 0o777, 0o755)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        self.assertFalse((unsafe / "state.json").exists())
+
+    def test_create_rejects_foreign_or_non_directory_session_objects(self) -> None:
+        foreign = self.root / "foreign-session"
+        foreign.mkdir(mode=0o700)
+        regular = self.root / "regular-session"
+        regular.write_text("keep", encoding="utf-8")
+
+        with patch(
+            "scripts.mac_cleanup.sessions.os.getuid", return_value=os.getuid() + 1
+        ), self.assertRaises(ValueError):
+            Session.create(foreign)
+        with self.assertRaises((NotADirectoryError, ValueError)):
+            Session.create(regular)
+
+        self.assertFalse((foreign / "state.json").exists())
+        self.assertEqual(regular.read_text(encoding="utf-8"), "keep")
+
+    def test_create_rejects_unsafe_preexisting_lock_without_touching_it(self) -> None:
+        for kind in ("symlink", "directory", "mode", "hardlink"):
+            with self.subTest(kind=kind):
+                session_path = self.root / f"session-{kind}"
+                session_path.mkdir(mode=0o700)
+                lock_path = session_path / ".session.lock"
+                unrelated = self.root / f"unrelated-{kind}"
+                unrelated.write_text("keep", encoding="utf-8")
+                if kind == "symlink":
+                    os.symlink(unrelated, lock_path)
+                elif kind == "directory":
+                    lock_path.mkdir(mode=0o700)
+                elif kind == "mode":
+                    lock_path.write_bytes(b"lock")
+                    os.chmod(lock_path, 0o644)
+                else:
+                    os.link(unrelated, lock_path)
+
+                with self.assertRaises((OSError, ValueError)):
+                    Session.create(session_path)
+
+                self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep")
+                self.assertFalse((session_path / "state.json").exists())
+
+    def test_lock_file_must_share_the_session_directory_device(self) -> None:
+        session_path = self.root / "different-device-session"
+        session_path.mkdir(mode=0o700)
+        lock_path = session_path / ".session.lock"
+        lock_path.write_bytes(b"lock")
+        os.chmod(lock_path, 0o600)
+        directory_descriptor = os.open(session_path, os.O_RDONLY)
+        real_fstat = os.fstat
+
+        def different_parent_device(descriptor: int) -> os.stat_result:
+            metadata = real_fstat(descriptor)
+            if descriptor != directory_descriptor:
+                return metadata
+            fields = list(metadata)
+            fields[2] = metadata.st_dev + 1
+            return os.stat_result(fields)
+
+        try:
+            with patch(
+                "scripts.mac_cleanup.sessions.os.fstat",
+                side_effect=different_parent_device,
+            ), self.assertRaises(ValueError):
+                _open_lock_file(directory_descriptor, create=False)
+        finally:
+            os.close(directory_descriptor)
+
+        self.assertEqual(lock_path.read_bytes(), b"lock")
+        self.assertEqual(os.stat(lock_path).st_mode & 0o777, 0o600)
+
+    def test_locked_inode_metadata_is_revalidated_after_open(self) -> None:
+        session = Session.create(self.session_path)
+        directory_metadata = os.stat(session.path)
+        descriptor = os.open(session.lock_path, os.O_RDWR)
+        os.chmod(session.lock_path, 0o640)
+
+        try:
+            with self.assertRaises(ValueError):
+                _same_lock_inode(
+                    session.lock_path,
+                    descriptor,
+                    (directory_metadata.st_dev, directory_metadata.st_ino),
+                )
+        finally:
+            os.close(descriptor)
+            os.chmod(session.lock_path, 0o600)
 
     def test_valid_lifecycle_is_persisted_and_terminal_state_cannot_reopen(self) -> None:
         session = Session.create(self.session_path)

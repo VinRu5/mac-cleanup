@@ -425,6 +425,45 @@ class ExecutorTest(unittest.TestCase):
         self.assertFalse(Path(first.path).exists())
         self.assertTrue(Path(second.path).exists())
 
+    def test_interrupted_exact_removal_marks_target_and_batch_accounting_unknown(self) -> None:
+        target = self._target("cache-a", b"first")
+        second_entry = Path(target.path) / "second.bin"
+        second_entry.write_bytes(b"second")
+        refreshed = inspect_path(target.path, (self.allowed_root,))
+        target = Target(
+            id=target.id,
+            path=refreshed.canonical,
+            kind=refreshed.kind,
+            risk=target.risk,
+            fingerprint=refreshed.fingerprint,
+            logical_bytes=refreshed.logical_bytes,
+        )
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+
+        def remove_one_then_fail(identity: object, roots: object) -> int:
+            del identity, roots
+            (Path(target.path) / "entry.bin").unlink()
+            raise OSError("simulated interruption after partial deletion")
+
+        with patch(
+            "scripts.mac_cleanup.executor.remove_tree_exact",
+            side_effect=remove_one_then_fail,
+        ):
+            outcome = apply_batch(self.session, batch, (self.allowed_root,))
+
+        self.assertIsNone(outcome.logical_bytes_removed)
+        self.assertEqual(outcome.logical_bytes_removed_by_target, ())
+        self.assertEqual(outcome.uncertain_target_ids, (target.id,))
+        self.assertTrue(outcome.suspended)
+        self.assertFalse((Path(target.path) / "entry.bin").exists())
+        self.assertTrue(second_entry.exists())
+        self.assertEqual(self.session.status(target.id), "suspended")
+        self.assertIn(
+            "executor.removal-accounting-uncertain",
+            {issue.code for issue in outcome.issues},
+        )
+
     def test_dry_run_has_no_state_transition_or_filesystem_mutation(self) -> None:
         target = self._target("cache-a")
         batch = Batch("safe-a", (target,))

@@ -108,7 +108,7 @@ class ManifestTest(unittest.TestCase):
 
         self.assertEqual(manifest.batches, ())
         with tempfile.TemporaryDirectory() as directory:
-            session = Session.create(Path(directory) / "session")
+            session = Session.create(Path(directory).resolve() / "session")
             session.write_manifest(manifest)
             with self.assertRaises(ValueError):
                 approve_batch(session, "safe-user-caches", "not-a-real-digest")
@@ -128,7 +128,7 @@ class ManifestTest(unittest.TestCase):
         )
         manifest = build_manifest(inventory, policy(allow_review_required=True))
         with tempfile.TemporaryDirectory() as directory:
-            session = Session.create(Path(directory) / "session")
+            session = Session.create(Path(directory).resolve() / "session")
             session.write_manifest(manifest)
 
             approve_batch(session, "safe-user-caches", approval_digest(manifest, "safe-user-caches"))
@@ -140,7 +140,7 @@ class ManifestTest(unittest.TestCase):
         inventory = ScanResult(targets=(self.safe,), executable_target_ids=(self.safe.id,))
         manifest = build_manifest(inventory, policy())
         with tempfile.TemporaryDirectory() as directory:
-            session = Session.create(Path(directory) / "session")
+            session = Session.create(Path(directory).resolve() / "session")
             session.write_manifest(manifest)
 
             with self.assertRaises(ValueError):
@@ -153,7 +153,7 @@ class ManifestTest(unittest.TestCase):
         inventory = ScanResult(targets=(self.safe,), executable_target_ids=(self.safe.id,))
         manifest = build_manifest(inventory, policy())
         with tempfile.TemporaryDirectory() as directory:
-            session = Session.create(Path(directory) / "session")
+            session = Session.create(Path(directory).resolve() / "session")
             session.write_manifest(manifest)
             changed = read_json(session.manifest_path)
             changed["batches"][0]["targets"][0]["fingerprint"] = "changed"  # type: ignore[index]
@@ -194,7 +194,7 @@ class ManifestTest(unittest.TestCase):
         )
         for name, manifest in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                session = Session.create(Path(directory) / "session")
+                session = Session.create(Path(directory).resolve() / "session")
                 session.write_manifest(manifest)
 
                 with self.assertRaises(ValueError):
@@ -208,7 +208,7 @@ class ManifestTest(unittest.TestCase):
         manifest = build_manifest(inventory, policy())
         for name in ("unknown", "omitted-default"):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                session = Session.create(Path(directory) / "session")
+                session = Session.create(Path(directory).resolve() / "session")
                 session.write_manifest(manifest)
                 changed = read_json(session.manifest_path)
                 if name == "unknown":

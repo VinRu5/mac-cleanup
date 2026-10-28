@@ -120,6 +120,8 @@ def _scan(session_path: Path, home: Path) -> int:
             fast = module.fast_scan(context)
             issues.extend(fast.issues)
             targets.update((target.id, target) for target in fast.targets)
+            if not fast.targets:
+                continue
             deep = module.deep_scan(context, tuple(target.id for target in fast.targets))
             issues.extend(deep.issues)
             targets.update((target.id, target) for target in deep.targets)
@@ -581,6 +583,7 @@ def _outcome_summary(command: str, outcome: BatchOutcome) -> dict[str, object]:
         "regenerated_bytes": outcome.regenerated_bytes,
         "regenerated_target_ids": sorted(outcome.regenerated_target_ids),
         "status": "suspended" if outcome.suspended else "success",
+        "uncertain_target_ids": sorted(outcome.uncertain_target_ids),
     }
 
 

@@ -18,8 +18,8 @@ class UserCachesModule:
     _TARGET_PREFIX = f"{id}:"
 
     def detect(self, context: ScanContext) -> bool:
-        """Detect a readable non-symlink cache root without proposing it."""
-        return _safe_directory(self._cache_root(context))
+        """Detect a present non-symlink cache root, even when it is unreadable."""
+        return _present_directory(self._cache_root(context))
 
     def fast_scan(self, context: ScanContext) -> ScanResult:
         """Inspect each immediate, non-Apple child of the fixed cache root."""
@@ -140,7 +140,7 @@ def _child_names(root: Path) -> tuple[tuple[str, ...], Issue | None]:
             return tuple(sorted(entry.name for entry in entries if _is_allowed_name(entry.name))), None
     except OSError as error:
         return (), Issue(
-            code="user-caches.cache-root-unreadable",
+            code="user-caches.cache-root-unavailable",
             severity=Severity.WARNING,
             message=f"Cannot enumerate approved cache root: {root}: {error}",
         )
@@ -152,10 +152,22 @@ def _safe_directory(path: Path) -> bool:
     except OSError:
         return False
     return (
+        _present_directory(path, metadata=path_stat)
+        and os.access(path, os.R_OK | os.X_OK)
+    )
+
+
+def _present_directory(
+    path: Path, *, metadata: os.stat_result | None = None
+) -> bool:
+    try:
+        path_stat = metadata if metadata is not None else path.lstat()
+    except OSError:
+        return False
+    return (
         stat.S_ISDIR(path_stat.st_mode)
         and not stat.S_ISLNK(path_stat.st_mode)
         and _has_no_symlink_components(path)
-        and os.access(path, os.R_OK | os.X_OK)
     )
 
 

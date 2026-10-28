@@ -18,6 +18,24 @@ from scripts.mac_cleanup.sessions import Session
 class IntegrationWorkflowTest(unittest.TestCase):
     maxDiff = None
 
+    def test_installation_handoff_documents_a_minimal_allowlist(self) -> None:
+        instructions = (Path(__file__).parents[1] / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(instructions.split())
+
+        for allowed in ("`SKILL.md`", "`agents/`", "`references/`", "`scripts/`"):
+            self.assertIn(allowed, normalized)
+        for excluded in (
+            "`.git/`",
+            "`.superpowers/`",
+            "task reports",
+            "`__pycache__/`",
+            "session directories",
+        ):
+            self.assertIn(excluded, normalized)
+        self.assertIn("Tests are optional", normalized)
+
     def test_complete_fixture_workflow_is_exact_resumable_and_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

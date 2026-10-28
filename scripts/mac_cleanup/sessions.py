@@ -84,7 +84,7 @@ def _local_session_lock(path: Path) -> _LocalSessionLock:
     global _LOCAL_LOCKS_PID
     if _LOCAL_LOCKS_PID != os.getpid():
         _reset_local_locks_after_fork()
-    key = str(path.resolve(strict=False))
+    key = str(path)
     with _LOCAL_LOCKS_GUARD:
         local = _LOCAL_LOCKS.get(key)
         if local is not None and local.pid != os.getpid():
@@ -96,34 +96,193 @@ def _local_session_lock(path: Path) -> _LocalSessionLock:
         return local
 
 
-def _same_lock_inode(path: Path, descriptor: int) -> bool:
-    try:
-        current = path.stat(follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    locked = os.fstat(descriptor)
-    return (current.st_dev, current.st_ino) == (locked.st_dev, locked.st_ino)
-
-
-def _acquire_stable_lock(path: Path) -> int:
-    """Lock the inode currently named by ``path``, retrying replacements."""
-    parent = path.parent.stat()
-    flags = os.O_CREAT | os.O_RDWR
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    for _ in range(_LOCK_ACQUIRE_ATTEMPTS):
-        descriptor = os.open(path, flags, 0o600)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _canonical_session_path(path: str | os.PathLike[str]) -> Path:
+    directory = Path(path)
+    if not directory.is_absolute() or ".." in directory.parts:
+        raise ValueError("session path must be absolute and canonical")
+    try:
+        canonical = directory.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("session path cannot be resolved safely") from error
+    if canonical != directory:
+        raise ValueError("session path must not contain symlinks or aliases")
+    return directory
+
+
+def _open_session_directory(
+    path: str | os.PathLike[str], *, create: bool
+) -> tuple[Path, int, tuple[int, int]]:
+    """Open a canonical session directory without following path components."""
+    directory = _canonical_session_path(path)
+    flags = _directory_open_flags()
+    descriptor = os.open(directory.anchor, flags)
+    created_final = False
+    try:
+        parts = directory.parts[1:]
+        for index, part in enumerate(parts):
+            created = False
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+                created = True
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            if index == len(parts) - 1:
+                created_final = created
+
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise SessionConsistencyError(
+                "session directory must be a current-user directory with mode 0700"
+            )
+        named = os.stat(directory, follow_symlinks=False)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if (named.st_dev, named.st_ino) != identity:
+            raise SessionConsistencyError("session directory identity changed")
+        if created_final and stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise SessionConsistencyError("new session directory mode is unsafe")
+        return directory, descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_bound_session_directory(
+    path: Path, expected_identity: tuple[int, int]
+) -> int:
+    directory, descriptor, identity = _open_session_directory(path, create=False)
+    del directory
+    if identity != expected_identity:
+        os.close(descriptor)
+        raise SessionConsistencyError("session directory was replaced")
+    return descriptor
+
+
+def _lock_open_flags() -> int:
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_lock_file(directory_descriptor: int, *, create: bool) -> int:
+    """Open the exact regular lock entry without modifying a preexisting object."""
+    flags = _lock_open_flags()
+    created = False
+    if create:
         try:
+            descriptor = os.open(
+                ".session.lock",
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(
+                ".session.lock", flags, dir_fd=directory_descriptor
+            )
+    else:
+        descriptor = os.open(".session.lock", flags, dir_fd=directory_descriptor)
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+        _validate_lock_descriptor(descriptor, directory_descriptor)
+        named = os.stat(
+            ".session.lock",
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        locked = os.fstat(descriptor)
+        if (named.st_dev, named.st_ino) != (locked.st_dev, locked.st_ino):
+            raise SessionConsistencyError("session lock metadata is unsafe")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _validate_lock_descriptor(
+    descriptor: int, directory_descriptor: int
+) -> None:
+    locked = os.fstat(descriptor)
+    parent = os.fstat(directory_descriptor)
+    if (
+        not stat.S_ISREG(locked.st_mode)
+        or locked.st_uid != os.getuid()
+        or locked.st_gid != parent.st_gid
+        or locked.st_dev != parent.st_dev
+        or locked.st_nlink != 1
+        or stat.S_IMODE(locked.st_mode) != 0o600
+    ):
+        raise SessionConsistencyError("session lock metadata is unsafe")
+
+
+def _same_lock_inode(
+    path: Path,
+    descriptor: int,
+    directory_identity: tuple[int, int],
+) -> bool:
+    try:
+        directory_descriptor = _open_bound_session_directory(
+            path.parent, directory_identity
+        )
+        try:
+            current = os.stat(
+                path.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
             locked = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(locked.st_mode)
-                or locked.st_uid != parent.st_uid
-                or locked.st_gid != parent.st_gid
-                or stat.S_IMODE(locked.st_mode) != 0o600
+            if (current.st_dev, current.st_ino) != (
+                locked.st_dev,
+                locked.st_ino,
             ):
-                raise SessionConsistencyError("session lock metadata is unsafe")
+                return False
+            _validate_lock_descriptor(descriptor, directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_stable_lock(
+    path: Path, directory_identity: tuple[int, int]
+) -> int:
+    """Lock the inode currently named by ``path``, retrying replacements."""
+    for _ in range(_LOCK_ACQUIRE_ATTEMPTS):
+        directory_descriptor = _open_bound_session_directory(
+            path.parent, directory_identity
+        )
+        try:
+            descriptor = _open_lock_file(directory_descriptor, create=True)
+        finally:
+            os.close(directory_descriptor)
+        try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-            if _same_lock_inode(path, descriptor):
+            if _same_lock_inode(path, descriptor, directory_identity):
                 return descriptor
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         except BaseException:
@@ -140,41 +299,67 @@ if hasattr(os, "register_at_fork"):
 class Session:
     """Own a session directory whose state file is the recovery authority."""
 
-    def __init__(self, path: Path, state: dict[str, object]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        state: dict[str, object],
+        directory_identity: tuple[int, int],
+    ) -> None:
         self.path = path
         self._state = state
+        self._directory_identity = directory_identity
 
     @classmethod
     def create(cls, path: str | os.PathLike[str]) -> "Session":
         """Create a fresh session without treating an existing state as resumable."""
-        directory = Path(path)
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(directory, 0o700)
-        state_path = directory / "state.json"
-        if state_path.exists():
-            raise FileExistsError(f"session state already exists: {state_path}")
-        state: dict[str, object] = {
-            "schema_version": SCHEMA_VERSION,
-            "created_at": _timestamp(),
-            "admin_scripts": {},
-            "critical_stop": None,
-            "events": [],
-            "issues": [],
-            "manifest": None,
-            "targets": {},
-        }
-        atomic_write_json(state_path, state)
-        session = cls(directory, state)
-        session._ensure_lock_file()
-        return session
+        directory, directory_descriptor, identity = _open_session_directory(
+            path, create=True
+        )
+        try:
+            try:
+                os.stat(
+                    "state.json",
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(
+                    f"session state already exists: {directory / 'state.json'}"
+                )
+            lock_descriptor = _open_lock_file(directory_descriptor, create=True)
+            os.close(lock_descriptor)
+            state: dict[str, object] = {
+                "schema_version": SCHEMA_VERSION,
+                "created_at": _timestamp(),
+                "admin_scripts": {},
+                "critical_stop": None,
+                "events": [],
+                "issues": [],
+                "manifest": None,
+                "targets": {},
+            }
+            named = os.stat(directory, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != identity:
+                raise SessionConsistencyError("session directory changed before state write")
+            atomic_write_json(directory / "state.json", state)
+        finally:
+            os.close(directory_descriptor)
+        return cls(directory, state, identity)
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "Session":
         """Load a persisted session; a missing state is never considered success."""
-        directory = Path(path)
-        state = read_json(directory / "state.json")
-        _validate_state(state)
-        session = cls(directory, state)
+        directory, descriptor, identity = _open_session_directory(
+            path, create=False
+        )
+        try:
+            state = read_json(directory / "state.json")
+            _validate_state(state)
+        finally:
+            os.close(descriptor)
+        session = cls(directory, state, identity)
         with session.operation_lock():
             session._reconcile_manifest()
         return session
@@ -217,7 +402,9 @@ class Session:
         outermost = local.depth == 0
         try:
             if outermost:
-                descriptor = _acquire_stable_lock(self.lock_path)
+                descriptor = _acquire_stable_lock(
+                    self.lock_path, self._directory_identity
+                )
                 local.file_descriptor = descriptor
             local.depth += 1
             self._reload_state_locked()
@@ -238,17 +425,23 @@ class Session:
         if (
             local.depth <= 0
             or local.file_descriptor is None
-            or not _same_lock_inode(self.lock_path, local.file_descriptor)
+            or not _same_lock_inode(
+                self.lock_path,
+                local.file_descriptor,
+                self._directory_identity,
+            )
         ):
             raise SessionConsistencyError("session lock was replaced during operation")
 
     def write_inventory(self, inventory: Mapping[str, object]) -> None:
+        self._assert_session_directory_current()
         atomic_write_json(self.inventory_path, _object(inventory, "inventory"))
 
     def read_inventory(self) -> dict[str, object]:
         return read_json(self.inventory_path)
 
     def write_policy(self, policy: Mapping[str, object]) -> None:
+        self._assert_session_directory_current()
         atomic_write_json(self.policy_path, _object(policy, "policy"))
 
     def read_policy(self) -> dict[str, object]:
@@ -302,6 +495,7 @@ class Session:
     def write_report(self, report: str) -> None:
         if not isinstance(report, str):
             raise TypeError("report must be text")
+        self._assert_session_directory_current()
         _atomic_write_text(self.report_path, report)
 
     def bind_admin_script(
@@ -444,11 +638,20 @@ class Session:
         return targets  # type: ignore[return-value]
 
     def _ensure_lock_file(self) -> None:
-        descriptor = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        directory_descriptor = _open_bound_session_directory(
+            self.path, self._directory_identity
+        )
         try:
-            os.fchmod(descriptor, 0o600)
-        finally:
+            descriptor = _open_lock_file(directory_descriptor, create=True)
             os.close(descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+    def _assert_session_directory_current(self) -> None:
+        descriptor = _open_bound_session_directory(
+            self.path, self._directory_identity
+        )
+        os.close(descriptor)
 
     def _reload_state_locked(self) -> None:
         state = read_json(self.state_path)

@@ -25,3 +25,12 @@ The commands return `0` for success, `2` for invalid input (including a bad dige
 - Use the report's separated logical removal, observed free-space delta, and regenerated-byte values; do not equate logical size with recovered APFS space.
 
 Read [references/risk-policy.md](references/risk-policy.md) before resolving a classification or exclusion dispute. Read [references/module-behavior.md](references/module-behavior.md) before developing a module or changing scan behavior.
+
+## Installation handoff
+
+Package the minimal skill by allowlist: `SKILL.md`, `agents/`, `references/`, and
+`scripts/` (including only the Python package files required by the engine). Tests are
+optional validation inputs and should be omitted from the minimal installed artifact.
+Exclude `.git/`, `.superpowers/`, task reports, final-fix reports, `__pycache__/`,
+`*.pyc`, and session directories or artifacts. Do not install the skill without the
+human's explicit permission.

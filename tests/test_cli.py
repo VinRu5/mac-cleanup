@@ -47,6 +47,50 @@ class CliTest(unittest.TestCase):
 
         self.assertIn("run", namespace)
 
+    def test_scan_rejects_symlinked_session_directory_without_external_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            (home / "Library" / "Caches").mkdir(parents=True)
+            real_session = root / "real-session"
+            real_session.mkdir(mode=0o700)
+            mode_before = os.stat(real_session).st_mode & 0o777
+            sentinel = real_session / "keep.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+            linked_session = root / "linked-session"
+            os.symlink(real_session, linked_session)
+
+            code, _ = self._run(
+                ["scan", "--session", str(linked_session)], trusted_home=home
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(os.stat(real_session).st_mode & 0o777, mode_before)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+            self.assertFalse((real_session / "state.json").exists())
+
+    def test_scan_rejects_symlinked_lock_without_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            (home / "Library" / "Caches").mkdir(parents=True)
+            session_path = root / "session"
+            session_path.mkdir(mode=0o700)
+            unrelated = root / "unrelated.txt"
+            unrelated.write_text("keep", encoding="utf-8")
+            os.chmod(unrelated, 0o640)
+            mode_before = os.stat(unrelated).st_mode & 0o777
+            os.symlink(unrelated, session_path / ".session.lock")
+
+            code, _ = self._run(
+                ["scan", "--session", str(session_path)], trusted_home=home
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(os.stat(unrelated).st_mode & 0o777, mode_before)
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep")
+            self.assertFalse((session_path / "state.json").exists())
+
     def test_approve_requires_exact_batch_and_digest(self) -> None:
         parser = build_parser()
         with self.assertRaises(SystemExit):
@@ -89,7 +133,7 @@ class CliTest(unittest.TestCase):
         }
         manifest = build_manifest(inventory, policy)
         with tempfile.TemporaryDirectory() as directory:
-            session = Session.create(Path(directory) / "session")
+            session = Session.create(Path(directory).resolve() / "session")
             session.write_manifest(manifest)
 
             result = main(["approve", "--session", str(session.path), "--batch", "safe-user-caches", "--digest", "wrong"])
@@ -174,6 +218,72 @@ class CliTest(unittest.TestCase):
             self.assertIn("Removed logical bytes: 10", report)
             self.assertIn("Observed `df` free-space delta:", report)
 
+    def test_partial_removal_persists_unknown_accounting_and_reports_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "partial"
+            target_path.mkdir(parents=True)
+            first = target_path / "first.bin"
+            second = target_path / "second.bin"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:partial",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+
+            def remove_one_then_fail(identity: object, roots: object) -> int:
+                del identity, roots
+                first.unlink()
+                raise OSError("simulated interruption after partial deletion")
+
+            with patch(
+                "scripts.mac_cleanup.executor.remove_tree_exact",
+                side_effect=remove_one_then_fail,
+            ):
+                apply_code, apply_text = self._run(
+                    [
+                        "apply",
+                        "--session",
+                        str(session.path),
+                        "--batch",
+                        batch.id,
+                    ],
+                    trusted_home=home,
+                )
+
+            self.assertEqual(apply_code, 3)
+            summary = json.loads(apply_text)
+            self.assertIsNone(summary["logical_bytes_removed"])
+            self.assertEqual(summary["uncertain_target_ids"], [target.id])
+            self.assertFalse(first.exists())
+            self.assertTrue(second.exists())
+            operation = read_json(session.path / "outcomes.json")["operations"][0]
+            self.assertIsNone(operation["logical_bytes_removed"])
+            self.assertEqual(operation["uncertain_target_ids"], [target.id])
+
+            report_code, report_path = self._run(
+                ["report", "--session", str(session.path)], trusted_home=home
+            )
+
+            self.assertEqual(report_code, 0)
+            report = Path(report_path).read_text(encoding="utf-8")
+            self.assertIn("Removed logical bytes: unknown", report)
+            self.assertIn(f"Removal accounting uncertainty: `{target.id}`", report)
+
     def test_cli_rejects_fingerprinted_user_cache_outside_trusted_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -247,6 +357,28 @@ class CliTest(unittest.TestCase):
                 ["safe-user-caches"],
             )
             self.assertRegex(plan_summary["batches"][0]["approval_digest"], r"^[0-9a-f]{64}$")
+
+    def test_scan_reports_present_but_unavailable_cache_root(self) -> None:
+        with fake_home() as home, tempfile.TemporaryDirectory() as directory:
+            session_path = Path(directory).resolve() / "session"
+
+            with patch(
+                "scripts.mac_cleanup.modules.user_caches.os.access",
+                return_value=False,
+            ):
+                code, text = self._run(
+                    ["scan", "--session", str(session_path)], trusted_home=home
+                )
+
+            summary = json.loads(text)
+            inventory = read_json(session_path / "inventory.json")
+            self.assertEqual(code, 0)
+            self.assertEqual(summary["detected_modules"], ["user-caches"])
+            self.assertEqual(summary["issue_count"], 1)
+            self.assertEqual(
+                [issue["code"] for issue in inventory["issues"]],
+                ["user-caches.cache-root-unavailable"],
+            )
 
     def test_report_command_writes_report_and_prints_only_its_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

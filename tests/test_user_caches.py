@@ -108,10 +108,34 @@ class UserCachesModuleTest(unittest.TestCase):
             "scripts.mac_cleanup.modules.user_caches.os.scandir",
             side_effect=PermissionError("denied"),
         ):
+            detected = self.module.detect(self.context)
             result = self.module.fast_scan(self.context)
 
+        self.assertTrue(detected)
         self.assertEqual(result.targets, ())
-        self.assertEqual([issue.code for issue in result.issues], ["user-caches.cache-root-unreadable"])
+        self.assertEqual(
+            [issue.code for issue in result.issues],
+            ["user-caches.cache-root-unavailable"],
+        )
+
+    def test_present_but_access_denied_root_is_detected_and_reported(self) -> None:
+        with patch(
+            "scripts.mac_cleanup.modules.user_caches.os.access", return_value=False
+        ):
+            detected = self.module.detect(self.context)
+            result = self.module.fast_scan(self.context)
+
+        self.assertTrue(detected)
+        self.assertEqual(result.targets, ())
+        self.assertEqual(
+            [issue.code for issue in result.issues],
+            ["user-caches.cache-root-unavailable"],
+        )
+
+    def test_absent_cache_root_is_not_detected(self) -> None:
+        missing_context = replace(self.context, home=self.home / "missing-home")
+
+        self.assertFalse(self.module.detect(missing_context))
 
     def test_deep_scan_does_not_accept_path_like_or_unknown_candidate_ids(self) -> None:
         result = self.module.deep_scan(

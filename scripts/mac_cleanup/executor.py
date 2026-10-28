@@ -22,7 +22,7 @@ class BatchOutcome:
 
     batch_id: str
     issues: tuple[Issue, ...] = field(default_factory=tuple)
-    logical_bytes_removed: int = 0
+    logical_bytes_removed: int | None = 0
     free_space_before: int | None = None
     free_space_after: int | None = None
     dry_run: bool = False
@@ -32,6 +32,7 @@ class BatchOutcome:
     logical_bytes_removed_by_target: tuple[tuple[str, int], ...] = field(
         default_factory=tuple
     )
+    uncertain_target_ids: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def free_space_delta(self) -> int | None:
@@ -126,6 +127,7 @@ def _apply_batch_locked(
     before = _free_space(roots, persisted)
     removed = 0
     removed_by_target: list[tuple[str, int]] = []
+    uncertain_target_ids: list[str] = []
     runtime_issues: list[Issue] = []
     for result in preflights:
         status = session.status(result.target.id)
@@ -150,12 +152,18 @@ def _apply_batch_locked(
             removed_by_target.append((result.target.id, target_removed))
         except PathSafetyError as error:
             runtime_issues.append(_issue_from_safety_error(result.target, error))
+            runtime_issues.append(_removal_accounting_issue(result.target))
+            uncertain_target_ids.append(result.target.id)
             break
         except PermissionError as error:
             runtime_issues.append(_permission_issue(result.target, error))
+            runtime_issues.append(_removal_accounting_issue(result.target))
+            uncertain_target_ids.append(result.target.id)
             break
         except OSError as error:
             runtime_issues.append(_os_issue(result.target, error))
+            runtime_issues.append(_removal_accounting_issue(result.target))
+            uncertain_target_ids.append(result.target.id)
             break
 
         session.transition(result.target.id, "applied")
@@ -177,8 +185,9 @@ def _apply_batch_locked(
         return BatchOutcome(
             batch_id=persisted.id,
             issues=issues + runtime,
-            logical_bytes_removed=removed,
+            logical_bytes_removed=(None if uncertain_target_ids else removed),
             logical_bytes_removed_by_target=tuple(removed_by_target),
+            uncertain_target_ids=tuple(uncertain_target_ids),
             free_space_before=before,
             free_space_after=after,
             suspended=True,
@@ -550,6 +559,16 @@ def _permission_issue(target: Target, error: BaseException) -> Issue:
         "executor.permission-denied",
         Severity.BATCH_ERROR,
         f"Permission denied for target: {target.path}: {error}",
+        target.id,
+    )
+
+
+def _removal_accounting_issue(target: Target) -> Issue:
+    return Issue(
+        "executor.removal-accounting-uncertain",
+        Severity.BATCH_ERROR,
+        "Exact removal was interrupted after mutation began; removed logical bytes "
+        f"are unknown for target: {target.path}",
         target.id,
     )
 
