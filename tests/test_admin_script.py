@@ -214,6 +214,23 @@ class AdminScriptTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._generate(Batch(batch.id, ()))
 
+    def test_admin_generation_stops_before_artifacts_on_unresolved_intent(self) -> None:
+        target = self._target("approved")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        self.session.begin_mutation_intent(
+            operation="apply",
+            batch_id=batch.id,
+            target_id=target.id,
+        )
+        script_path, result_path = self._paths()
+
+        with self.assertRaisesRegex(ValueError, "unresolved mutation intent"):
+            self._generate(batch)
+
+        self.assertFalse(script_path.exists())
+        self.assertFalse(result_path.exists())
+
     def test_changed_identity_stops_script_and_leaves_later_target_untouched(self) -> None:
         changed = self._target("a-changed", b"old")
         later = self._target("b-later")

@@ -116,11 +116,11 @@ try:
         state=json.loads(read_regular_at(session_fd,"state.json","state",uid,gid,0o600).decode("utf-8"))
     except (UnicodeDecodeError,json.JSONDecodeError):
         fail("state is not JSON")
-    if not isinstance(state,dict) or set(state)!={"schema_version","created_at","admin_scripts","critical_stop","events","issues","manifest","targets"} or state.get("schema_version")!=1:
+    if not isinstance(state,dict) or set(state)!={"schema_version","created_at","admin_scripts","critical_stop","events","issues","manifest","mutation_intent","targets"} or state.get("schema_version")!=1:
         fail("state schema is invalid")
     if not isinstance(state.get("created_at"),str) or not isinstance(state.get("events"),list) or not isinstance(state.get("issues"),list):
         fail("state fields are invalid")
-    if state.get("critical_stop") is not None or not isinstance(state.get("targets"),dict) or state["targets"].get(target_id)!="approved":
+    if state.get("critical_stop") is not None or state.get("mutation_intent") is not None or not isinstance(state.get("targets"),dict) or state["targets"].get(target_id)!="approved":
         fail("target is not currently approved")
     if any(not isinstance(key,str) or value not in {"pending","approved","applied","verified","suspended","skipped","failed"} for key,value in state["targets"].items()):
         fail("target states are invalid")
@@ -234,6 +234,8 @@ def generate_admin_script(
     allowed_root = _trusted_cache_root(home)
 
     with session.operation_lock():
+        if session.mutation_intent() is not None:
+            raise ValueError("session has an unresolved mutation intent")
         if session.critical_issue() is not None:
             raise ValueError("session has a critical safety stop")
         persisted = _approved_session_batch(session, batch)
@@ -341,6 +343,8 @@ def validate_admin_artifacts(
     allowed_root = _trusted_cache_root(_trusted_home(trusted_home))
 
     with session.operation_lock():
+        if session.mutation_intent() is not None:
+            raise ValueError("session has an unresolved mutation intent")
         if session.critical_issue() is not None:
             raise ValueError("session has a critical safety stop")
         binding = session.admin_script_binding(batch_id)
@@ -465,6 +469,8 @@ def import_admin_results(
     allowed_root = _trusted_cache_root(home)
 
     with session.operation_lock():
+        if session.mutation_intent() is not None:
+            raise ValueError("session has an unresolved mutation intent")
         if session.critical_issue() is not None:
             raise ValueError("session has a critical safety stop")
         bindings = _admin_bindings(session)

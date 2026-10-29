@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .admin_script import AdminArtifactValidation, validate_admin_artifacts
-from .executor import BatchOutcome
+from .executor import BatchOutcome, _unresolved_mutation_intent_issue
 from .jsonio import atomic_write_json, read_json
 from .models import Issue, Manifest, Severity
 from .sessions import Session, SessionConsistencyError
@@ -89,15 +89,22 @@ def render_report(
 def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
     manifest = session.read_manifest()
     state = session.state
+    intent = state.get("mutation_intent")
+    if intent is not None and not isinstance(intent, Mapping):
+        raise ValueError("session mutation intent is malformed")
     accounting_lost = accounting_lock_loss_issue(state)
     outcomes = (
         []
-        if accounting_lost is not None
+        if intent is not None or accounting_lost is not None
         else _read_outcome_document(session)["operations"]
     )
     assert isinstance(outcomes, list)
     _validate_operations_membership(manifest, outcomes)
-    validations = _admin_validations(session, manifest, state, trusted_home)
+    validations = (
+        {}
+        if intent is not None
+        else _admin_validations(session, manifest, state, trusted_home)
+    )
 
     lines = [
         "# Mac Cleanup Report",
@@ -122,6 +129,10 @@ def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
         removed_by_target = _removed_by_target(apply_outcomes)
         absent_ids = _absent_target_ids(apply_outcomes)
         uncertain_ids = _uncertain_target_ids(apply_outcomes)
+        if intent is not None and intent.get("batch_id") == batch.id:
+            target_id = intent.get("target_id")
+            if isinstance(target_id, str):
+                uncertain_ids.add(target_id)
         lines.extend(
             [
                 f"## Batch `{batch.id}`",
@@ -149,7 +160,11 @@ def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
             )
         lines.append("")
 
-    issues = _issues(manifest, state, outcomes)
+    issues = list(_issues(manifest, state, outcomes))
+    if intent is not None:
+        issues.append(_unresolved_mutation_intent_issue(dict(intent)))
+        issues = list({_issue_key(issue): issue for issue in issues}.values())
+        issues.sort(key=_issue_key)
     lines.extend(["## Issues by severity", ""])
     for severity in _SEVERITY_ORDER:
         lines.extend([f"### {severity}", ""])
@@ -173,6 +188,11 @@ def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
             binding = bindings[batch_id]
             if not isinstance(binding, Mapping):
                 raise ValueError("session administrative binding is malformed")
+            if intent is not None:
+                lines.append(
+                    f"- `{batch_id}` validation blocked by unresolved mutation intent."
+                )
+                continue
             validation = validations[batch_id]
             batch = next(batch for batch in manifest.batches if batch.id == batch_id)
             authorized = all(
@@ -482,6 +502,13 @@ def _required_actions(
     validations: Mapping[str, AdminArtifactValidation],
 ) -> tuple[str, ...]:
     actions: list[str] = []
+    intent = state.get("mutation_intent")
+    if isinstance(intent, Mapping):
+        return (
+            "Stop all cleanup. Removed logical bytes are unknown for "
+            f"`{intent.get('target_id')}`. Start a fresh session, rescan the "
+            "filesystem, and obtain a new approval before any further mutation.",
+        )
     critical = state.get("critical_stop")
     if critical is not None:
         if not isinstance(critical, Mapping):

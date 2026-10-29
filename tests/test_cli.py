@@ -279,7 +279,7 @@ class CliTest(unittest.TestCase):
                 ["report", "--session", str(session.path)], trusted_home=home
             )
 
-            self.assertEqual(report_code, 0)
+            self.assertEqual(report_code, 4)
             report = Path(report_path).read_text(encoding="utf-8")
             self.assertIn("Removed logical bytes: unknown", report)
             self.assertIn(f"Removal accounting uncertainty: `{target.id}`", report)
@@ -351,12 +351,12 @@ class CliTest(unittest.TestCase):
                 ["report", "--session", str(session.path)], trusted_home=home
             )
 
-            self.assertEqual(report_code, 0)
+            self.assertEqual(report_code, 4)
             report = Path(report_path).read_text(encoding="utf-8")
             self.assertIn("Removed logical bytes: unknown", report)
             self.assertIn(f"Removal accounting uncertainty: `{target.id}`", report)
             self.assertIn("`executor.lifecycle-checkpoint-failed`", report)
-            self.assertIn("`executor.removal-accounting-uncertain`", report)
+            self.assertIn("`executor.unresolved-mutation-intent`", report)
 
     def test_cli_rejects_fingerprinted_user_cache_outside_trusted_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -705,7 +705,7 @@ class CliTest(unittest.TestCase):
             report_code, report_path = self._run(
                 ["report", "--session", str(session.path)], trusted_home=home
             )
-            self.assertEqual(report_code, 0)
+            self.assertEqual(report_code, 4)
             report = Path(report_path).read_text(encoding="utf-8")
             self.assertIn("reporting.accounting-lock-lost", report)
             self.assertIn("Removed logical bytes: unknown", report)
@@ -1309,3 +1309,124 @@ class CliTest(unittest.TestCase):
                 "administrative artifact validation failed",
             )
             self.assertTrue(target_path.exists())
+
+    def test_outcome_write_failure_after_delete_leaves_durable_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "publication"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"cache")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:publication",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            real_write = atomic_write_json
+
+            def fail_outcome(path: str | Path, value: object) -> None:
+                if Path(path).name == "outcomes.json":
+                    raise OSError("simulated outcome publication failure")
+                real_write(path, value)
+
+            with patch(
+                "scripts.mac_cleanup.reporting.atomic_write_json",
+                side_effect=fail_outcome,
+            ):
+                code, text = self._run(
+                    ["apply", "--session", str(session.path), "--batch", batch.id],
+                    trusted_home=home,
+                )
+
+            self.assertEqual(code, 4)
+            self.assertFalse(target_path.exists())
+            self.assertIsNotNone(Session.load(session.path).mutation_intent())
+            self.assertFalse((session.path / "outcomes.json").exists())
+            self.assertIn(
+                "executor.outcome-publication-failed",
+                {issue["code"] for issue in json.loads(text)["issues"]},
+            )
+
+            with patch(
+                "scripts.mac_cleanup.executor.remove_tree_exact"
+            ) as retried:
+                for command in ("apply", "verify"):
+                    retry_code, retry_text = self._run(
+                        [
+                            command,
+                            "--session",
+                            str(session.path),
+                            "--batch",
+                            batch.id,
+                        ],
+                        trusted_home=home,
+                    )
+                    self.assertEqual(retry_code, 4)
+                    self.assertIn("unresolved-mutation-intent", retry_text)
+            retried.assert_not_called()
+
+    def test_applied_and_latch_failures_still_block_reload_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "double-failure"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"cache")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:double-failure",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            real_transition = Session.transition
+
+            def fail_applied(
+                current: Session, target_id: str, destination: str
+            ) -> None:
+                if destination == "applied":
+                    raise OSError("simulated lifecycle failure")
+                real_transition(current, target_id, destination)
+
+            with patch.object(Session, "transition", new=fail_applied), patch.object(
+                Session,
+                "latch_critical",
+                side_effect=OSError("simulated latch failure"),
+            ):
+                code, _ = self._run(
+                    ["apply", "--session", str(session.path), "--batch", batch.id],
+                    trusted_home=home,
+                )
+
+            resumed = Session.load(session.path)
+            self.assertEqual(code, 4)
+            self.assertEqual(resumed.status(target.id), "approved")
+            self.assertIsNone(resumed.critical_issue())
+            self.assertIsNotNone(resumed.mutation_intent())
+            report_code, report_path = self._run(
+                ["report", "--session", str(session.path)], trusted_home=home
+            )
+            self.assertEqual(report_code, 4)
+            report = Path(report_path).read_text(encoding="utf-8")
+            self.assertIn("Removed logical bytes: unknown", report)
+            self.assertIn("Start a fresh session", report)

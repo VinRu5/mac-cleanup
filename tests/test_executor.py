@@ -10,6 +10,7 @@ from unittest.mock import patch
 from scripts.mac_cleanup.executor import apply_batch, preflight_target, verify_batch
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Severity, Target
 from scripts.mac_cleanup.paths import PathSafetyError, inspect_path, remove_tree_exact
+from scripts.mac_cleanup.reporting import record_batch_outcome
 from scripts.mac_cleanup.sessions import Session
 
 
@@ -338,7 +339,12 @@ class ExecutorTest(unittest.TestCase):
         target = self._target("cache-a")
         batch = Batch("safe-a", (target,))
         self._write_and_approve(batch)
-        first = apply_batch(self.session, batch, (self.allowed_root,))
+        first = apply_batch(
+            self.session,
+            batch,
+            (self.allowed_root,),
+            outcome_recorder=lambda outcome: None,
+        )
         state_after_first = self.session.state
 
         second = apply_batch(self.session, batch, (self.allowed_root,))
@@ -352,7 +358,12 @@ class ExecutorTest(unittest.TestCase):
         target = self._target("cache-a")
         batch = Batch("safe-a", (target,))
         self._write_and_approve(batch)
-        apply_batch(self.session, batch, (self.allowed_root,))
+        apply_batch(
+            self.session,
+            batch,
+            (self.allowed_root,),
+            outcome_recorder=lambda outcome: None,
+        )
         recreated = Path(target.path)
         recreated.mkdir()
         content = b"regenerated-cache"
@@ -552,6 +563,143 @@ class ExecutorTest(unittest.TestCase):
             "executor.lifecycle-checkpoint-failed",
             {issue.code for issue in outcome.issues},
         )
+
+    def test_direct_apply_leaves_durable_intent_and_reload_never_retries(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+
+        first = apply_batch(self.session, batch, (self.allowed_root,))
+        resumed = Session.load(self.session.path)
+        with patch(
+            "scripts.mac_cleanup.executor.remove_tree_exact"
+        ) as retried:
+            second = apply_batch(resumed, batch, (self.allowed_root,))
+
+        self.assertEqual(first.logical_bytes_removed, target.logical_bytes)
+        self.assertIsNotNone(resumed.mutation_intent())
+        self.assertTrue(second.suspended)
+        self.assertIn(
+            "executor.unresolved-mutation-intent",
+            {issue.code for issue in second.issues},
+        )
+        retried.assert_not_called()
+
+    def test_success_clears_intent_only_after_outcome_recorder_returns(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        observed: list[dict[str, object]] = []
+
+        def record(outcome: object) -> None:
+            del outcome
+            intent = self.session.mutation_intent()
+            self.assertIsNotNone(intent)
+            observed.append(intent)  # type: ignore[arg-type]
+
+        outcome = apply_batch(
+            self.session,
+            batch,
+            (self.allowed_root,),
+            outcome_recorder=record,
+        )
+
+        self.assertFalse(outcome.suspended)
+        self.assertEqual(len(observed), 1)
+        self.assertIsNone(self.session.mutation_intent())
+
+    def test_post_delete_free_space_failure_is_conservative_and_keeps_intent(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        with patch(
+            "scripts.mac_cleanup.executor._free_space",
+            side_effect=(1_000, OSError("simulated post-delete df failure")),
+        ):
+            outcome = apply_batch(
+                self.session,
+                batch,
+                (self.allowed_root,),
+                outcome_recorder=lambda value: record_batch_outcome(
+                    self.session, "apply", value
+                ),
+            )
+
+        self.assertFalse(Path(target.path).exists())
+        self.assertTrue(outcome.suspended)
+        self.assertIsNone(outcome.logical_bytes_removed)
+        self.assertEqual(outcome.uncertain_target_ids, (target.id,))
+        self.assertTrue((self.session.path / "outcomes.json").is_file())
+        self.assertIsNotNone(Session.load(self.session.path).mutation_intent())
+        self.assertIn(
+            "executor.accounting-checkpoint-failed",
+            {issue.code for issue in outcome.issues},
+        )
+
+    def test_recorded_outcome_with_failed_intent_clear_remains_blocked(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        recorded: list[object] = []
+
+        with patch.object(
+            self.session,
+            "clear_mutation_intent",
+            side_effect=OSError("simulated final checkpoint failure"),
+        ):
+            outcome = apply_batch(
+                self.session,
+                batch,
+                (self.allowed_root,),
+                outcome_recorder=recorded.append,
+            )
+
+        self.assertEqual(len(recorded), 1)
+        self.assertTrue(outcome.suspended)
+        self.assertIsNone(outcome.logical_bytes_removed)
+        self.assertIn(
+            "executor.intent-clear-failed",
+            {issue.code for issue in outcome.issues},
+        )
+        self.assertIsNotNone(Session.load(self.session.path).mutation_intent())
+
+    def test_concurrent_apply_waits_then_stops_on_unresolved_intent(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        entered = threading.Event()
+        release = threading.Event()
+        real_remove = remove_tree_exact
+        results: list[object] = []
+
+        def blocking_remove(*args: object, **kwargs: object) -> int:
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return real_remove(*args, **kwargs)  # type: ignore[arg-type]
+
+        def run(session: Session) -> None:
+            results.append(apply_batch(session, batch, (self.allowed_root,)))
+
+        with patch(
+            "scripts.mac_cleanup.executor.remove_tree_exact",
+            side_effect=blocking_remove,
+        ) as remove:
+            first = threading.Thread(target=run, args=(self.session,))
+            second = threading.Thread(
+                target=run, args=(Session.load(self.session.path),)
+            )
+            first.start()
+            self.assertTrue(entered.wait(5))
+            second.start()
+            release.set()
+            first.join(5)
+            second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(remove.call_count, 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results[1].suspended)  # type: ignore[attr-defined]
 
     def test_dry_run_has_no_state_transition_or_filesystem_mutation(self) -> None:
         target = self._target("cache-a")

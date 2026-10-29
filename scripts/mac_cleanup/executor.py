@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import errno
 import fcntl
@@ -9,11 +10,10 @@ import os
 from pathlib import Path
 import shutil
 import stat
-from typing import Iterable
 
 from .models import Batch, Issue, Severity, Target
 from .paths import PathIdentity, PathSafetyError, inspect_path, remove_tree_exact
-from .sessions import Session
+from .sessions import Session, SessionConsistencyError
 
 
 @dataclass(frozen=True)
@@ -65,11 +65,23 @@ def apply_batch(
     allowed_roots: Iterable[str | os.PathLike[str]],
     *,
     dry_run: bool = False,
+    outcome_recorder: Callable[[BatchOutcome], None] | None = None,
 ) -> BatchOutcome:
-    """Preflight an entire approved batch, then remove each exact identity."""
+    """Preflight and apply a batch under a durable mutation/accounting intent.
+
+    A caller that does not supply ``outcome_recorder`` receives the result but
+    deliberately leaves the intent unresolved.  Only durable outcome publication
+    followed by the final state checkpoint may clear it.
+    """
     roots = tuple(allowed_roots)
     with session.operation_lock():
-        return _apply_batch_locked(session, batch, roots, dry_run=dry_run)
+        return _apply_batch_locked(
+            session,
+            batch,
+            roots,
+            dry_run=dry_run,
+            outcome_recorder=outcome_recorder,
+        )
 
 
 def _apply_batch_locked(
@@ -78,7 +90,11 @@ def _apply_batch_locked(
     roots: tuple[str | os.PathLike[str], ...],
     *,
     dry_run: bool,
+    outcome_recorder: Callable[[BatchOutcome], None] | None,
 ) -> BatchOutcome:
+    unresolved = session.mutation_intent()
+    if unresolved is not None:
+        return _unresolved_intent_outcome(batch.id, unresolved, dry_run=dry_run)
     persisted = _approved_session_batch(session, batch)
     latched = session.critical_issue()
     if latched is not None:
@@ -129,6 +145,7 @@ def _apply_batch_locked(
     removed_by_target: list[tuple[str, int]] = []
     uncertain_target_ids: list[str] = []
     runtime_issues: list[Issue] = []
+    intent: dict[str, object] | None = None
     for result in preflights:
         status = session.status(result.target.id)
         if status == "verified":
@@ -146,6 +163,29 @@ def _apply_batch_locked(
 
         assert result.identity is not None
         session.assert_operation_lock_current()
+        try:
+            if intent is None:
+                intent = session.begin_mutation_intent(
+                    operation="apply",
+                    batch_id=persisted.id,
+                    target_id=result.target.id,
+                )
+            elif intent["target_id"] != result.target.id:
+                intent = session.advance_mutation_intent(
+                    str(intent["operation_id"]), result.target.id
+                )
+        except Exception as error:
+            if intent is None:
+                raise
+            runtime_issues.append(_lifecycle_checkpoint_issue(result.target, error))
+            _mark_checkpoint_accounting_uncertain(
+                _intent_target(persisted, intent),
+                runtime_issues,
+                uncertain_target_ids,
+                removed_by_target,
+            )
+            removed = sum(count for _, count in removed_by_target)
+            break
         try:
             target_removed = remove_tree_exact(result.identity, roots)
         except PathSafetyError as error:
@@ -186,7 +226,22 @@ def _apply_batch_locked(
             runtime_issues.append(verification_issue)
             break
 
-    after = _free_space(roots, persisted)
+    try:
+        after = _free_space(roots, persisted)
+    except Exception as error:
+        if intent is None:
+            raise
+        current = _intent_target(persisted, intent)
+        runtime_issues.append(_accounting_checkpoint_issue(current, error))
+        _mark_checkpoint_accounting_uncertain(
+            current,
+            runtime_issues,
+            uncertain_target_ids,
+            removed_by_target,
+        )
+        removed = sum(count for _, count in removed_by_target)
+        before = None
+        after = None
     if runtime_issues:
         runtime = tuple(runtime_issues)
         try:
@@ -213,7 +268,7 @@ def _apply_batch_locked(
                 removed_by_target,
             )
             removed = sum(count for _, count in removed_by_target)
-        return BatchOutcome(
+        outcome = BatchOutcome(
             batch_id=persisted.id,
             issues=issues + runtime,
             logical_bytes_removed=(None if uncertain_target_ids else removed),
@@ -225,7 +280,14 @@ def _apply_batch_locked(
             regenerated_bytes=regenerated_bytes,
             regenerated_target_ids=regenerated_ids,
         )
-    return BatchOutcome(
+        return _finalize_apply_outcome(
+            session,
+            outcome,
+            intent,
+            outcome_recorder,
+            clear_allowed=False,
+        )
+    outcome = BatchOutcome(
         batch_id=persisted.id,
         issues=issues,
         logical_bytes_removed=removed,
@@ -234,6 +296,13 @@ def _apply_batch_locked(
         free_space_after=after,
         regenerated_bytes=regenerated_bytes,
         regenerated_target_ids=regenerated_ids,
+    )
+    return _finalize_apply_outcome(
+        session,
+        outcome,
+        intent,
+        outcome_recorder,
+        clear_allowed=True,
     )
 
 
@@ -253,6 +322,9 @@ def _verify_batch_locked(
     batch: Batch,
     roots: tuple[str | os.PathLike[str], ...],
 ) -> BatchOutcome:
+    unresolved = session.mutation_intent()
+    if unresolved is not None:
+        return _unresolved_intent_outcome(batch.id, unresolved, dry_run=False)
     persisted = _approved_session_batch(session, batch)
     latched = session.critical_issue()
     if latched is not None:
@@ -611,6 +683,134 @@ def _lifecycle_checkpoint_issue(target: Target, error: BaseException) -> Issue:
         "Durable lifecycle checkpoint failed after removal; session state may not "
         f"match the filesystem for target: {target.path}: {error}",
         target.id,
+    )
+
+
+def _accounting_checkpoint_issue(target: Target, error: BaseException) -> Issue:
+    return Issue(
+        "executor.accounting-checkpoint-failed",
+        Severity.CRITICAL,
+        "Post-removal free-space/accounting checkpoint failed; filesystem mutation "
+        f"may have completed for target: {target.path}: {error}",
+        target.id,
+    )
+
+
+def _unresolved_mutation_intent_issue(intent: dict[str, object]) -> Issue:
+    return Issue(
+        "executor.unresolved-mutation-intent",
+        Severity.CRITICAL,
+        "A prior cleanup mutation has no complete durable accounting checkpoint. "
+        "Removed logical bytes are unknown; do not retry this target. Start a fresh "
+        "session and rescan before any further cleanup.",
+        str(intent["target_id"]),
+    )
+
+
+def _unresolved_intent_outcome(
+    batch_id: str, intent: dict[str, object], *, dry_run: bool
+) -> BatchOutcome:
+    target_id = str(intent["target_id"])
+    return BatchOutcome(
+        batch_id=batch_id,
+        issues=(_unresolved_mutation_intent_issue(intent),),
+        logical_bytes_removed=None,
+        uncertain_target_ids=(target_id,),
+        dry_run=dry_run,
+        suspended=True,
+    )
+
+
+def _intent_target(batch: Batch, intent: dict[str, object]) -> Target:
+    target_id = str(intent["target_id"])
+    matches = tuple(target for target in batch.targets if target.id == target_id)
+    if len(matches) != 1:
+        raise ValueError("mutation intent target is absent from its batch")
+    return matches[0]
+
+
+def _finalize_apply_outcome(
+    session: Session,
+    outcome: BatchOutcome,
+    intent: dict[str, object] | None,
+    outcome_recorder: Callable[[BatchOutcome], None] | None,
+    *,
+    clear_allowed: bool,
+) -> BatchOutcome:
+    if outcome_recorder is None:
+        return outcome
+    try:
+        outcome_recorder(outcome)
+    except SessionConsistencyError:
+        raise
+    except Exception as error:
+        if intent is None:
+            raise
+        return _conservative_intent_outcome(
+            outcome,
+            intent,
+            "executor.outcome-publication-failed",
+            "Durable outcome publication failed after cleanup mutation; removed "
+            f"logical bytes are unknown: {error}",
+        )
+    if intent is None or not clear_allowed:
+        return outcome
+    try:
+        session.clear_mutation_intent(str(intent["operation_id"]))
+    except SessionConsistencyError:
+        raise
+    except Exception as error:
+        return _conservative_intent_outcome(
+            outcome,
+            intent,
+            "executor.intent-clear-failed",
+            "The outcome was published but the final mutation-intent checkpoint "
+            f"failed; accounting remains conservatively unknown: {error}",
+        )
+    return outcome
+
+
+def _conservative_intent_outcome(
+    outcome: BatchOutcome,
+    intent: dict[str, object],
+    code: str,
+    message: str,
+) -> BatchOutcome:
+    target_id = str(intent["target_id"])
+    issues = list(outcome.issues)
+    issues.append(Issue(code, Severity.CRITICAL, message, target_id))
+    if not any(
+        issue.code == "executor.removal-accounting-uncertain"
+        and issue.target_id == target_id
+        for issue in issues
+    ):
+        issues.append(
+            Issue(
+                "executor.removal-accounting-uncertain",
+                Severity.BATCH_ERROR,
+                "Exact removal may have completed without a durable accounting "
+                f"checkpoint for target: {target_id}",
+                target_id,
+            )
+        )
+    return BatchOutcome(
+        batch_id=outcome.batch_id,
+        issues=tuple(issues),
+        logical_bytes_removed=None,
+        free_space_before=outcome.free_space_before,
+        free_space_after=outcome.free_space_after,
+        dry_run=outcome.dry_run,
+        suspended=True,
+        regenerated_bytes=outcome.regenerated_bytes,
+        regenerated_target_ids=outcome.regenerated_target_ids,
+        logical_bytes_removed_by_target=tuple(
+            item
+            for item in outcome.logical_bytes_removed_by_target
+            if item[0] != target_id
+        ),
+        uncertain_target_ids=tuple(
+            sorted(set(outcome.uncertain_target_ids) | {target_id})
+        ),
     )
 
 

@@ -10,10 +10,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import threading
 from typing import Iterator, Mapping, Sequence
+import uuid
 
 from .jsonio import atomic_write_json, canonical_bytes, read_json
 from .models import Issue, Manifest, Severity, TargetStatus
@@ -338,6 +340,7 @@ class Session:
                 "events": [],
                 "issues": [],
                 "manifest": None,
+                "mutation_intent": None,
                 "targets": {},
             }
             named = os.stat(directory, follow_symlinks=False)
@@ -575,6 +578,95 @@ class Session:
             issues.append(record.copy())
             self._persist_state(next_state)
 
+    def mutation_intent(self) -> dict[str, object] | None:
+        """Return the authoritative unresolved mutation/accounting intent."""
+        with self.operation_lock():
+            value = self._state.get("mutation_intent")
+            if value is None:
+                return None
+            assert isinstance(value, Mapping)
+            return copy.deepcopy(dict(value))
+
+    def begin_mutation_intent(
+        self, *, operation: str, batch_id: str, target_id: str
+    ) -> dict[str, object]:
+        """Persist the fail-safe authority immediately before cleanup mutation."""
+        if operation != "apply":
+            raise ValueError("mutation intent operation must be apply")
+        if not isinstance(batch_id, str) or not batch_id:
+            raise ValueError("mutation intent batch id must be non-empty text")
+        if not isinstance(target_id, str) or not target_id:
+            raise ValueError("mutation intent target id must be non-empty text")
+        with self.operation_lock():
+            if self._state.get("mutation_intent") is not None:
+                raise SessionConsistencyError(
+                    "session has an unresolved mutation intent"
+                )
+            manifest = self._read_manifest_locked()
+            matches = tuple(batch for batch in manifest.batches if batch.id == batch_id)
+            if len(matches) != 1 or target_id not in {
+                target.id for target in matches[0].targets
+            }:
+                raise ValueError("mutation intent must name a manifest batch target")
+            if self._status_locked(target_id) != "approved":
+                raise ValueError("mutation intent target must be approved")
+            intent: dict[str, object] = {
+                "batch_id": batch_id,
+                "created_at": _timestamp(),
+                "operation": operation,
+                "operation_id": uuid.uuid4().hex,
+                "schema_version": SCHEMA_VERSION,
+                "target_id": target_id,
+            }
+            _validate_mutation_intent(intent)
+            next_state = copy.deepcopy(self._state)
+            next_state["mutation_intent"] = intent
+            self._persist_state(next_state)
+            return copy.deepcopy(intent)
+
+    def advance_mutation_intent(
+        self, operation_id: str, target_id: str
+    ) -> dict[str, object]:
+        """Checkpoint the next exact target before its deletion begins."""
+        with self.operation_lock():
+            current = self._mutation_intent_for_operation(operation_id)
+            manifest = self._read_manifest_locked()
+            batch_id = current["batch_id"]
+            matches = tuple(batch for batch in manifest.batches if batch.id == batch_id)
+            if len(matches) != 1 or target_id not in {
+                target.id for target in matches[0].targets
+            }:
+                raise ValueError("mutation intent must name a manifest batch target")
+            if self._status_locked(target_id) != "approved":
+                raise ValueError("mutation intent target must be approved")
+            next_intent = copy.deepcopy(current)
+            next_intent["target_id"] = target_id
+            _validate_mutation_intent(next_intent)
+            next_state = copy.deepcopy(self._state)
+            next_state["mutation_intent"] = next_intent
+            self._persist_state(next_state)
+            return copy.deepcopy(next_intent)
+
+    def clear_mutation_intent(self, operation_id: str) -> None:
+        """Clear only the exact intent whose accounting was durably published."""
+        with self.operation_lock():
+            self._mutation_intent_for_operation(operation_id)
+            next_state = copy.deepcopy(self._state)
+            next_state["mutation_intent"] = None
+            self._persist_state(next_state)
+
+    def _mutation_intent_for_operation(
+        self, operation_id: str
+    ) -> dict[str, object]:
+        value = self._state.get("mutation_intent")
+        if not isinstance(value, Mapping):
+            raise ValueError("session has no unresolved mutation intent")
+        intent = dict(value)
+        _validate_mutation_intent(intent)
+        if intent["operation_id"] != operation_id:
+            raise ValueError("mutation intent operation id changed")
+        return intent
+
     def status(self, target_id: str) -> str:
         with self.operation_lock():
             return self._status_locked(target_id)
@@ -787,6 +879,19 @@ def _canonical_object(value: Mapping[str, object]) -> dict[str, object]:
 
 def _validate_state(state: Mapping[str, object]) -> None:
     _require_schema(state, "state")
+    expected_fields = {
+        "admin_scripts",
+        "created_at",
+        "critical_stop",
+        "events",
+        "issues",
+        "manifest",
+        "mutation_intent",
+        "schema_version",
+        "targets",
+    }
+    if set(state) != expected_fields:
+        raise ValueError("state fields do not match schema version 1")
     for key, expected in (("created_at", str), ("events", list), ("issues", list), ("targets", dict)):
         if not isinstance(state.get(key), expected):
             raise ValueError(f"state {key} must be a {expected.__name__}")
@@ -812,6 +917,55 @@ def _validate_state(state: Mapping[str, object]) -> None:
         critical_issue = Issue.from_dict(critical_stop)
         if critical_issue.severity is not Severity.CRITICAL:
             raise ValueError("state critical_stop must contain a critical issue")
+    intent = state.get("mutation_intent")
+    if intent is not None:
+        _validate_mutation_intent(intent)
+        if record is None:
+            raise ValueError("state mutation_intent requires a manifest record")
+        value = record["value"]
+        assert isinstance(value, Mapping)
+        manifest = Manifest.from_dict(value)
+        batches = tuple(
+            batch for batch in manifest.batches if batch.id == intent["batch_id"]
+        )
+        if len(batches) != 1 or intent["target_id"] not in {
+            target.id for target in batches[0].targets
+        }:
+            raise ValueError("state mutation_intent is not bound to its manifest")
+
+
+def _validate_mutation_intent(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("state mutation_intent must be an object or null")
+    expected = {
+        "batch_id",
+        "created_at",
+        "operation",
+        "operation_id",
+        "schema_version",
+        "target_id",
+    }
+    if (
+        set(value) != expected
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != SCHEMA_VERSION
+    ):
+        raise ValueError("state mutation_intent fields do not match schema")
+    if value.get("operation") != "apply":
+        raise ValueError("state mutation_intent operation is invalid")
+    if not isinstance(value.get("created_at"), str) or re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", value["created_at"]
+    ) is None:
+        raise ValueError("state mutation_intent timestamp is invalid")
+    if not isinstance(value.get("batch_id"), str) or not value["batch_id"]:
+        raise ValueError("state mutation_intent batch id is invalid")
+    if not isinstance(value.get("target_id"), str) or not value["target_id"]:
+        raise ValueError("state mutation_intent target id is invalid")
+    operation_id = value.get("operation_id")
+    if not isinstance(operation_id, str) or re.fullmatch(
+        r"[0-9a-f]{32}", operation_id
+    ) is None:
+        raise ValueError("state mutation_intent operation id is invalid")
 
 
 def _timestamp() -> str:

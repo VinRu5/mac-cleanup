@@ -461,6 +461,57 @@ class SessionTest(unittest.TestCase):
         reloaded = Session.load(self.session_path)
         self.assertEqual(reloaded.state["targets"], {"cache-a": "pending", "cache-b": "pending"})
 
+    def test_mutation_intent_is_strict_durable_and_compare_cleared(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        session.transition("cache-a", "approved")
+
+        intent = session.begin_mutation_intent(
+            operation="apply",
+            batch_id="safe-caches",
+            target_id="cache-a",
+        )
+
+        self.assertEqual(Session.load(self.session_path).mutation_intent(), intent)
+        with self.assertRaises(ValueError):
+            session.clear_mutation_intent("0" * 32)
+        self.assertEqual(session.mutation_intent(), intent)
+        session.clear_mutation_intent(intent["operation_id"])
+        self.assertIsNone(Session.load(self.session_path).mutation_intent())
+
+    def test_load_rejects_malformed_mutation_intent_schema(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        state = read_json(session.state_path)
+        valid = {
+            "batch_id": "safe-caches",
+            "created_at": "2026-10-28T00:00:00.000000Z",
+            "operation": "apply",
+            "operation_id": "a" * 32,
+            "schema_version": 1,
+            "target_id": "cache-a",
+        }
+        for label, mutate in {
+            "missing": lambda value: value.pop("target_id"),
+            "extra": lambda value: value.update(extra=True),
+            "bad operation": lambda value: value.update(operation="verify"),
+            "bad id": lambda value: value.update(operation_id="not-a-uuid"),
+            "unknown target": lambda value: value.update(target_id="unknown"),
+        }.items():
+            with self.subTest(label=label):
+                candidate = dict(valid)
+                mutate(candidate)
+                state["mutation_intent"] = candidate
+                atomic_write_json(session.state_path, state)
+                with self.assertRaises(ValueError):
+                    Session.load(self.session_path)
+        state["mutation_intent"] = None
+        atomic_write_json(session.state_path, state)
+        del state["mutation_intent"]
+        atomic_write_json(session.state_path, state)
+        with self.assertRaises(ValueError):
+            Session.load(self.session_path)
+
 
 if __name__ == "__main__":
     unittest.main()

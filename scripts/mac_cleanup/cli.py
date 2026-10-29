@@ -11,7 +11,12 @@ import pwd
 import re
 
 from .admin_script import generate_admin_script, import_admin_results
-from .executor import BatchOutcome, apply_batch, verify_batch
+from .executor import (
+    BatchOutcome,
+    _unresolved_mutation_intent_issue,
+    apply_batch,
+    verify_batch,
+)
 from .manifests import approval_digest, approve_batch, build_manifest
 from .models import Batch, Issue, Severity, Target, TargetStatus
 from .modules.base import ScanContext, ScanResult
@@ -188,6 +193,13 @@ def _apply(session_path: Path, batch_id: str, dry_run: bool, home: Path) -> int:
     mutation_may_have_completed = False
     try:
         with session.operation_lock():
+            unresolved = session.mutation_intent()
+            if unresolved is not None:
+                return _critical_accounting_stop(
+                    "apply",
+                    batch_id,
+                    _unresolved_mutation_intent_issue(unresolved),
+                )
             existing = accounting_lock_loss_issue(session.state)
             if existing is not None:
                 return _critical_accounting_stop("apply", batch_id, existing)
@@ -243,8 +255,14 @@ def _apply(session_path: Path, batch_id: str, dry_run: bool, home: Path) -> int:
                 return BATCH_SUSPENDED
 
             mutation_may_have_completed = True
-            outcome = apply_batch(session, batch, roots)
-            record_batch_outcome(session, "apply", outcome)
+            outcome = apply_batch(
+                session,
+                batch,
+                roots,
+                outcome_recorder=lambda value: record_batch_outcome(
+                    session, "apply", value
+                ),
+            )
             _print_json(_outcome_summary("apply", outcome))
             return _outcome_exit(outcome)
     except (OutcomeLockIdentityError, SessionConsistencyError):
@@ -261,6 +279,13 @@ def _verify(session_path: Path, batch_id: str, home: Path) -> int:
     mutation_may_have_completed = False
     try:
         with session.operation_lock():
+            unresolved = session.mutation_intent()
+            if unresolved is not None:
+                return _critical_accounting_stop(
+                    "verify",
+                    batch_id,
+                    _unresolved_mutation_intent_issue(unresolved),
+                )
             existing = accounting_lock_loss_issue(session.state)
             if existing is not None:
                 return _critical_accounting_stop("verify", batch_id, existing)
@@ -320,12 +345,13 @@ def _report(session_path: Path, home: Path) -> int:
     session = Session.load(session_path)
     try:
         with session.operation_lock():
+            unresolved = session.mutation_intent()
             report = render_report(session, trusted_home=home)
             session.assert_operation_lock_current()
             session.write_report(report)
             session.assert_operation_lock_current()
         print(session.report_path)
-        return SUCCESS
+        return CRITICAL_SAFETY_FAILURE if unresolved is not None else SUCCESS
     except (OutcomeLockIdentityError, SessionConsistencyError):
         return _recover_accounting_lock_loss(
             session_path,

@@ -397,6 +397,43 @@ class ReportingTest(unittest.TestCase):
                 )
             self.assertFalse((self.session.path / "outcomes.json").exists())
 
+    def test_unresolved_intent_report_ignores_missing_or_malformed_outcomes(self) -> None:
+        target = Target(
+            id="user-caches:uncertain",
+            path=str(self.root / "home" / "Library" / "Caches" / "uncertain"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch("safe-user-caches", (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        self.session.transition(target.id, "approved")
+        self.session.begin_mutation_intent(
+            operation="apply",
+            batch_id="safe-user-caches",
+            target_id=target.id,
+        )
+
+        for label, malformed in (("missing", False), ("malformed", True)):
+            with self.subTest(label=label):
+                path = self.session.path / "outcomes.json"
+                if malformed:
+                    atomic_write_json(path, {"invalid": True})
+                elif path.exists():
+                    path.unlink()
+                report = render_report(self.session)
+                self.assertIn("Removed logical bytes: unknown", report)
+                self.assertIn(
+                    f"Removal accounting uncertainty: `{target.id}`", report
+                )
+                self.assertIn("`executor.unresolved-mutation-intent`", report)
+                self.assertIn("Start a fresh session", report)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 # Final fix report
 
-- Base HEAD: `101e017`
+- Base HEAD: `73ae5d5`
 - Final review findings addressed: session-directory and lock ingress hardening;
   interrupted-removal accounting; unavailable cache-root detection; minimal
   installation handoff allowlist.
@@ -16,6 +16,21 @@
   resulting critical stop are converted to a critical suspended outcome. The current
   target remains accounting-unknown, completed earlier target counts are preserved,
   and no speculative lifecycle transition or deletion retry is attempted.
+- Durable mutation/accounting protocol: authoritative `state.json` now records a
+  strict, operation/batch/target-bound intent immediately before the first exact
+  deletion. It survives deletion, lifecycle, free-space, outcome-publication, latch,
+  and final-checkpoint failures. Apply, verify, administrative paths, and reporting
+  check this authority before outcome reads or mutation, return the critical stop,
+  never retry or credit the uncertain target, and require a fresh session/rescan.
+- Two-phase completion: the CLI supplies the executor a narrow durable-outcome
+  callback. The intent is cleared only after that callback returns and the final
+  state checkpoint succeeds. Direct executor callers leave the intent unresolved by
+  default; a successful outcome write followed by a failed clear remains blocked and
+  is reported conservatively.
+- Conservative reporting: an unresolved intent takes precedence over missing,
+  malformed, or even successfully written outcome history. Removed logical bytes and
+  free-space recovery remain unknown, while the report names the uncertain target and
+  the required fresh-session recovery action.
 - Discovery: present but inaccessible cache roots remain detected and yield one
   `user-caches.cache-root-unavailable` warning; absent roots remain undetected.
 - Installation handoff: only `SKILL.md`, `agents/`, `references/`, `scripts/`, and
@@ -25,9 +40,9 @@
 ## Verification
 
 - Targeted final-finding suite: 84 tests passed before the final lock self-review.
-- Post-review focused suite: executor, CLI, reporting, and integration — 61 tests
-  passed.
-- Full suite after all changes: `python3 -m unittest discover -s tests` — 149 tests
+- Post-review focused suite: session, executor, CLI, reporting, administrative, and
+  integration paths — 120 tests passed.
+- Full suite after all changes: `python3 -m unittest discover -s tests` — 160 tests
   passed.
 - Integration suite: 2 tests passed.
 - Python compilation: all tracked Python files passed `py_compile`.
