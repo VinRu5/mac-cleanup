@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from scripts.mac_cleanup.jsonio import atomic_write_json, canonical_bytes, read_json
@@ -35,6 +36,19 @@ class ModelsTest(unittest.TestCase):
             atomic_write_json(path, {"unicode": "café", "n": 1})
             self.assertEqual(read_json(path), {"unicode": "café", "n": 1})
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_atomic_json_has_no_fallible_post_replace_chmod(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+
+            with patch(
+                "scripts.mac_cleanup.jsonio.os.chmod",
+                side_effect=OSError("post-replace chmod must not run"),
+            ) as chmod:
+                atomic_write_json(path, {"schema_version": 2})
+
+            chmod.assert_not_called()
+            self.assertEqual(read_json(path), {"schema_version": 2})
 
 
 if __name__ == "__main__":

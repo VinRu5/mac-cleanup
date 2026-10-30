@@ -195,8 +195,9 @@ def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
                 continue
             validation = validations[batch_id]
             batch = next(batch for batch in manifest.batches if batch.id == batch_id)
-            authorized = all(
-                statuses.get(target.id) == "approved" for target in batch.targets
+            batch_statuses = tuple(statuses.get(target.id) for target in batch.targets)
+            authorized = "approved" in batch_statuses and all(
+                status in {"approved", "verified"} for status in batch_statuses
             )
             lines.extend(_admin_lines(validation, authorized=authorized))
         lines.append("")
@@ -243,7 +244,10 @@ def _outcome_value(
         "free_space_delta": outcome.free_space_delta,
         "issues": [
             issue.to_dict()
-            for issue in sorted(outcome.issues, key=_issue_key)
+            for issue in sorted(
+                {_issue_key(issue): issue for issue in outcome.issues}.values(),
+                key=_issue_key,
+            )
         ],
         "logical_bytes_removed": outcome.logical_bytes_removed,
         "logical_bytes_removed_by_target": [
@@ -520,8 +524,13 @@ def _required_actions(
         )
     for batch in sorted(manifest.batches, key=lambda value: value.id):
         validation = validations.get(batch.id)
-        if validation is not None and all(
-            statuses.get(target.id) == "approved" for target in batch.targets
+        batch_statuses = tuple(statuses.get(target.id) for target in batch.targets)
+        if (
+            validation is not None
+            and "approved" in batch_statuses
+            and all(
+                status in {"approved", "verified"} for status in batch_statuses
+            )
         ):
             actions.append(
                 f"For `{batch.id}`, confirm SHA-256 `{validation.checksum}`, then execute "

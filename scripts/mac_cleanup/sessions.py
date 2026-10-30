@@ -21,7 +21,9 @@ from .jsonio import atomic_write_json, canonical_bytes, read_json
 from .models import Issue, Manifest, Severity, TargetStatus
 
 
-SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
+INTENT_SCHEMA_VERSION = 1
 _LOCK_ACQUIRE_ATTEMPTS = 8
 
 ALLOWED_TRANSITIONS = {
@@ -333,7 +335,7 @@ class Session:
             lock_descriptor = _open_lock_file(directory_descriptor, create=True)
             os.close(lock_descriptor)
             state: dict[str, object] = {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": STATE_SCHEMA_VERSION,
                 "created_at": _timestamp(),
                 "admin_scripts": {},
                 "critical_stop": None,
@@ -359,7 +361,7 @@ class Session:
         )
         try:
             state = read_json(directory / "state.json")
-            _validate_state(state)
+            _validate_loadable_state(state)
         finally:
             os.close(descriptor)
         session = cls(directory, state, identity)
@@ -588,11 +590,23 @@ class Session:
             return copy.deepcopy(dict(value))
 
     def begin_mutation_intent(
-        self, *, operation: str, batch_id: str, target_id: str
+        self,
+        *,
+        operation: str,
+        batch_id: str,
+        target_id: str,
+        operation_binding: str | None = None,
     ) -> dict[str, object]:
         """Persist the fail-safe authority immediately before cleanup mutation."""
-        if operation != "apply":
-            raise ValueError("mutation intent operation must be apply")
+        if operation not in {"apply", "admin_apply"}:
+            raise ValueError("mutation intent operation is invalid")
+        if operation == "apply" and operation_binding is not None:
+            raise ValueError("direct mutation intent must not have an operation binding")
+        if operation == "admin_apply" and (
+            not isinstance(operation_binding, str)
+            or re.fullmatch(r"[0-9a-f]{64}", operation_binding) is None
+        ):
+            raise ValueError("administrative mutation intent binding is invalid")
         if not isinstance(batch_id, str) or not batch_id:
             raise ValueError("mutation intent batch id must be non-empty text")
         if not isinstance(target_id, str) or not target_id:
@@ -614,8 +628,10 @@ class Session:
                 "batch_id": batch_id,
                 "created_at": _timestamp(),
                 "operation": operation,
+                "operation_binding": operation_binding,
                 "operation_id": uuid.uuid4().hex,
-                "schema_version": SCHEMA_VERSION,
+                "primary_issue": None,
+                "schema_version": INTENT_SCHEMA_VERSION,
                 "target_id": target_id,
             }
             _validate_mutation_intent(intent)
@@ -647,13 +663,44 @@ class Session:
             self._persist_state(next_state)
             return copy.deepcopy(next_intent)
 
+    def record_mutation_intent_issue(
+        self, operation_id: str, issue: Issue
+    ) -> dict[str, object]:
+        """Persist the first exact post-intent failure before secondary checkpoints."""
+        if not isinstance(issue, Issue):
+            raise TypeError("mutation intent diagnostic must be an Issue")
+        with self.operation_lock():
+            current = self._mutation_intent_for_operation(operation_id)
+            existing = current.get("primary_issue")
+            value = issue.to_dict()
+            if existing is not None:
+                if existing != value:
+                    return copy.deepcopy(current)
+                return copy.deepcopy(current)
+            next_intent = copy.deepcopy(current)
+            next_intent["primary_issue"] = value
+            _validate_mutation_intent(next_intent)
+            next_state = copy.deepcopy(self._state)
+            next_state["mutation_intent"] = next_intent
+            self._persist_state(next_state)
+            return copy.deepcopy(next_intent)
+
     def clear_mutation_intent(self, operation_id: str) -> None:
         """Clear only the exact intent whose accounting was durably published."""
         with self.operation_lock():
             self._mutation_intent_for_operation(operation_id)
             next_state = copy.deepcopy(self._state)
             next_state["mutation_intent"] = None
-            self._persist_state(next_state)
+            try:
+                self._persist_state(next_state)
+            except BaseException:
+                self.assert_operation_lock_current()
+                committed = read_json(self.state_path)
+                _validate_state(committed)
+                self._state = committed
+                if committed.get("mutation_intent") is None:
+                    return
+                raise
 
     def _mutation_intent_for_operation(
         self, operation_id: str
@@ -747,7 +794,26 @@ class Session:
 
     def _reload_state_locked(self) -> None:
         state = read_json(self.state_path)
-        _validate_state(state)
+        if state.get("schema_version") == 1:
+            _validate_legacy_state(state)
+            migrated = copy.deepcopy(state)
+            migrated["schema_version"] = STATE_SCHEMA_VERSION
+            migrated["mutation_intent"] = None
+            _validate_state(migrated)
+            try:
+                atomic_write_json(self.state_path, migrated)
+            except BaseException:
+                self.assert_operation_lock_current()
+                committed = read_json(self.state_path)
+                if committed != migrated:
+                    _validate_loadable_state(committed)
+                    raise
+                _validate_state(committed)
+                state = committed
+            else:
+                state = migrated
+        else:
+            _validate_state(state)
         self._state = state
 
     def _persist_state(self, state: dict[str, object]) -> None:
@@ -802,8 +868,10 @@ def _object(value: Mapping[str, object], label: str) -> dict[str, object]:
 
 
 def _require_schema(value: Mapping[str, object], label: str) -> None:
-    if value.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"{label} schema_version must be {SCHEMA_VERSION}")
+    if value.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"{label} schema_version must be {MANIFEST_SCHEMA_VERSION}"
+        )
 
 
 def _strict_manifest_value(value: Mapping[str, object]) -> dict[str, object]:
@@ -878,7 +946,11 @@ def _canonical_object(value: Mapping[str, object]) -> dict[str, object]:
 
 
 def _validate_state(state: Mapping[str, object]) -> None:
-    _require_schema(state, "state")
+    if (
+        type(state.get("schema_version")) is not int
+        or state.get("schema_version") != STATE_SCHEMA_VERSION
+    ):
+        raise ValueError(f"state schema_version must be {STATE_SCHEMA_VERSION}")
     expected_fields = {
         "admin_scripts",
         "created_at",
@@ -891,7 +963,7 @@ def _validate_state(state: Mapping[str, object]) -> None:
         "targets",
     }
     if set(state) != expected_fields:
-        raise ValueError("state fields do not match schema version 1")
+        raise ValueError("state fields do not match schema version 2")
     for key, expected in (("created_at", str), ("events", list), ("issues", list), ("targets", dict)):
         if not isinstance(state.get(key), expected):
             raise ValueError(f"state {key} must be a {expected.__name__}")
@@ -920,6 +992,16 @@ def _validate_state(state: Mapping[str, object]) -> None:
     intent = state.get("mutation_intent")
     if intent is not None:
         _validate_mutation_intent(intent)
+        if intent["operation"] == "admin_apply":
+            binding = admin_scripts.get(intent["batch_id"])
+            if (
+                not isinstance(binding, Mapping)
+                or binding.get("operation_digest")
+                != intent["operation_binding"]
+            ):
+                raise ValueError(
+                    "state administrative mutation_intent binding is not durable"
+                )
         if record is None:
             raise ValueError("state mutation_intent requires a manifest record")
         value = record["value"]
@@ -941,18 +1023,36 @@ def _validate_mutation_intent(value: object) -> None:
         "batch_id",
         "created_at",
         "operation",
+        "operation_binding",
         "operation_id",
+        "primary_issue",
         "schema_version",
         "target_id",
     }
     if (
         set(value) != expected
         or type(value.get("schema_version")) is not int
-        or value.get("schema_version") != SCHEMA_VERSION
+        or value.get("schema_version") != INTENT_SCHEMA_VERSION
     ):
         raise ValueError("state mutation_intent fields do not match schema")
-    if value.get("operation") != "apply":
+    operation = value.get("operation")
+    binding = value.get("operation_binding")
+    if operation not in {"apply", "admin_apply"}:
         raise ValueError("state mutation_intent operation is invalid")
+    if operation == "apply" and binding is not None:
+        raise ValueError("state direct mutation_intent binding is invalid")
+    if operation == "admin_apply" and (
+        not isinstance(binding, str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding) is None
+    ):
+        raise ValueError("state administrative mutation_intent binding is invalid")
+    primary_issue = value.get("primary_issue")
+    if primary_issue is not None:
+        if not isinstance(primary_issue, Mapping):
+            raise ValueError("state mutation_intent primary issue is invalid")
+        parsed = Issue.from_dict(primary_issue)
+        if dict(primary_issue) != parsed.to_dict():
+            raise ValueError("state mutation_intent primary issue is not canonical")
     if not isinstance(value.get("created_at"), str) or re.fullmatch(
         r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", value["created_at"]
     ) is None:
@@ -968,6 +1068,36 @@ def _validate_mutation_intent(value: object) -> None:
         raise ValueError("state mutation_intent operation id is invalid")
 
 
+def _validate_legacy_state(state: Mapping[str, object]) -> None:
+    expected = {
+        "admin_scripts",
+        "created_at",
+        "critical_stop",
+        "events",
+        "issues",
+        "manifest",
+        "schema_version",
+        "targets",
+    }
+    if (
+        set(state) != expected
+        or type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+    ):
+        raise ValueError("legacy state fields do not match schema version 1")
+    migrated = copy.deepcopy(dict(state))
+    migrated["schema_version"] = STATE_SCHEMA_VERSION
+    migrated["mutation_intent"] = None
+    _validate_state(migrated)
+
+
+def _validate_loadable_state(state: Mapping[str, object]) -> None:
+    if state.get("schema_version") == 1:
+        _validate_legacy_state(state)
+        return
+    _validate_state(state)
+
+
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -981,8 +1111,19 @@ def _atomic_write_text(path: Path, value: str) -> None:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise OSError("temporary text metadata is unsafe")
         os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, _directory_open_flags())
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(temporary)

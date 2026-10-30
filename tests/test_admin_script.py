@@ -19,6 +19,7 @@ from scripts.mac_cleanup.admin_script import (
 from scripts.mac_cleanup.executor import apply_batch
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Target
 from scripts.mac_cleanup.paths import inspect_path
+from scripts.mac_cleanup.reporting import record_batch_outcome, render_report
 from scripts.mac_cleanup.sessions import Session
 
 
@@ -114,6 +115,28 @@ class AdminScriptTest(unittest.TestCase):
         )
         return checksum, script_path, result_path
 
+    def _verifier_arguments(
+        self, batch: Batch, target: Target
+    ) -> tuple[str, ...]:
+        binding = self.session.state["admin_scripts"][batch.id]
+        return (
+            str(self.session.path),
+            binding["snapshot_path"],
+            binding["snapshot_digest"],
+            binding["output_path"],
+            binding["result_path"],
+            binding["operation_digest"],
+            batch.id,
+            json.dumps(target.to_dict(), sort_keys=True, separators=(",", ":")),
+            binding["allowed_root"],
+            str(binding["session_uid"]),
+            str(binding["session_gid"]),
+            binding["manifest_digest"],
+            target.id,
+            target.path,
+            target.fingerprint,
+        )
+
     def test_quote_zsh_literal_handles_an_embedded_single_quote(self) -> None:
         self.assertEqual(quote_zsh_literal("a'b"), "'a'\\''b'")
 
@@ -176,6 +199,189 @@ class AdminScriptTest(unittest.TestCase):
             trusted_home=self.home,
         )
         self.assertEqual(self.session.status(target.id), "verified")
+
+    def test_admin_intent_survives_manual_gap_and_clears_only_after_accounting(self) -> None:
+        target = self._target("approved")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        checksum, script_path, result_path = self._generate(batch)
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        reloaded = Session.load(self.session.path)
+        intent = reloaded.mutation_intent()
+        self.assertEqual(intent["operation"], "admin_apply")  # type: ignore[index]
+        self.assertEqual(intent["target_id"], target.id)  # type: ignore[index]
+        report = render_report(reloaded, trusted_home=self.home)
+        self.assertIn("Removed logical bytes: unknown", report)
+        observed_intents: list[dict[str, object]] = []
+
+        def publish(value: object) -> None:
+            current = reloaded.mutation_intent()
+            self.assertIsNotNone(current)
+            observed_intents.append(current)  # type: ignore[arg-type]
+            record_batch_outcome(reloaded, "apply", value)  # type: ignore[arg-type]
+
+        outcome = import_admin_results(
+            reloaded,
+            result_path,
+            checksum,
+            trusted_home=self.home,
+            outcome_recorder=publish,
+        )
+        self.assertIsNotNone(outcome)
+        self.assertEqual(len(observed_intents), 1)
+        self.assertIsNone(Session.load(self.session.path).mutation_intent())
+        self.assertEqual(reloaded.status(target.id), "verified")
+
+    def test_bootstrap_and_verifier_reject_unrelated_intent_before_delete(self) -> None:
+        target = self._target("approved")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        _checksum, script_path, _result_path = self._generate(batch)
+        self.session.begin_mutation_intent(
+            operation="apply", batch_id=batch.id, target_id=target.id
+        )
+
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(Path(target.path).exists())
+
+        namespace = {"__name__": "verifier_test"}
+        exec(compile(_VERIFIER_SOURCE, "<verifier>", "exec"), namespace)
+        result = namespace["_run"](self._verifier_arguments(batch, target))
+        self.assertEqual(result, 64)
+        self.assertTrue(Path(target.path).exists())
+
+    def test_crash_after_admin_delete_leaves_intent_and_unknown_report(self) -> None:
+        target = self._target("approved")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        self._generate(batch)
+        namespace = {"__name__": "verifier_test"}
+        exec(compile(_VERIFIER_SOURCE, "<verifier>", "exec"), namespace)
+
+        namespace["_checkpoint"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated result checkpoint crash")
+        )
+        with self.assertRaises(RuntimeError):
+            namespace["_run"](self._verifier_arguments(batch, target))
+
+        self.assertFalse(Path(target.path).exists())
+        reloaded = Session.load(self.session.path)
+        self.assertEqual(
+            reloaded.mutation_intent()["target_id"], target.id  # type: ignore[index]
+        )
+        self.assertIn(
+            "Removed logical bytes: unknown",
+            render_report(reloaded, trusted_home=self.home),
+        )
+
+    def test_verifier_rechecks_intent_created_after_bootstrap_releases_lock(self) -> None:
+        target = self._target("gap-race")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        self._generate(batch)
+        namespace = {"__name__": "verifier_test"}
+        exec(compile(_VERIFIER_SOURCE, "<verifier>", "exec"), namespace)
+        real_acquire = namespace["_acquire_stable_lock"]
+        injected = False
+
+        def acquire_after_direct_intent(
+            session_fd: int, uid: int, gid: int
+        ) -> int:
+            nonlocal injected
+            if not injected:
+                injected = True
+                self.session.begin_mutation_intent(
+                    operation="apply", batch_id=batch.id, target_id=target.id
+                )
+            return real_acquire(session_fd, uid, gid)
+
+        namespace["_acquire_stable_lock"] = acquire_after_direct_intent
+
+        result = namespace["_run"](self._verifier_arguments(batch, target))
+
+        self.assertEqual(result, 64)
+        self.assertTrue(Path(target.path).exists())
+        self.assertEqual(
+            Session.load(self.session.path).mutation_intent()["operation"],  # type: ignore[index]
+            "apply",
+        )
+
+    def test_multi_target_admin_batch_advances_one_accounted_target_per_run(self) -> None:
+        first = self._target("a-first")
+        second = self._target("b-second")
+        batch = Batch("safe-user-caches", (first, second))
+        self._register(batch)
+        checksum, script_path, result_path = self._generate(batch)
+
+        first_run = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertNotEqual(first_run.returncode, 0)
+        self.assertFalse(Path(first.path).exists())
+        self.assertTrue(Path(second.path).exists())
+        self.assertEqual(
+            Session.load(self.session.path).mutation_intent()["target_id"],  # type: ignore[index]
+            first.id,
+        )
+        import_admin_results(
+            self.session,
+            result_path,
+            checksum,
+            trusted_home=self.home,
+            outcome_recorder=lambda value: record_batch_outcome(
+                self.session, "apply", value
+            ),
+        )
+        self.assertEqual(self.session.status(first.id), "verified")
+        self.assertEqual(self.session.status(second.id), "approved")
+        self.assertIsNone(self.session.mutation_intent())
+        repeated_checksum, repeated_script, repeated_result = self._generate(batch)
+        self.assertEqual(repeated_checksum, checksum)
+        self.assertEqual(repeated_script, script_path)
+        self.assertEqual(repeated_result, result_path)
+
+        second_run = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+
+        self.assertEqual(second_run.returncode, 0, second_run.stderr)
+        self.assertFalse(Path(second.path).exists())
+        self.assertEqual(
+            Session.load(self.session.path).mutation_intent()["target_id"],  # type: ignore[index]
+            second.id,
+        )
+        import_admin_results(
+            self.session,
+            result_path,
+            checksum,
+            trusted_home=self.home,
+            outcome_recorder=lambda value: record_batch_outcome(
+                self.session, "apply", value
+            ),
+        )
+        reloaded = Session.load(self.session.path)
+        self.assertEqual(reloaded.status(first.id), "verified")
+        self.assertEqual(reloaded.status(second.id), "verified")
+        self.assertIsNone(reloaded.mutation_intent())
+        outcomes = json.loads(
+            (self.session.path / "outcomes.json").read_text(encoding="utf-8")
+        )["operations"]
+        self.assertEqual(
+            [
+                operation["logical_bytes_removed_by_target"][0]["target_id"]
+                for operation in outcomes
+            ],
+            [first.id, second.id],
+        )
 
     def test_generation_rejects_a_forged_approved_target_outside_trusted_cache(self) -> None:
         outside_root = self.root / "outside"
@@ -396,7 +602,11 @@ class AdminScriptTest(unittest.TestCase):
         self.assertTrue(recreated.exists())
         self.assertTrue(Path(later.path).exists())
         results = json.loads(result_path.read_text(encoding="utf-8"))
-        self.assertEqual(results["targets"][target.id]["status"], "suspended")
+        self.assertEqual(results["targets"][target.id]["status"], "verified")
+        self.assertEqual(
+            Session.load(self.session.path).mutation_intent()["target_id"],  # type: ignore[index]
+            target.id,
+        )
 
     def test_critical_result_latches_session_and_blocks_independent_import(self) -> None:
         unsafe = self._target("unsafe")

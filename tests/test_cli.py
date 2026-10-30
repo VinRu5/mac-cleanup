@@ -5,6 +5,7 @@ import io
 import os
 import runpy
 import copy
+import subprocess
 import threading
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -356,8 +357,6 @@ class CliTest(unittest.TestCase):
             self.assertIn("Removed logical bytes: unknown", report)
             self.assertIn(f"Removal accounting uncertainty: `{target.id}`", report)
             self.assertIn("`executor.lifecycle-checkpoint-failed`", report)
-            self.assertIn("`executor.unresolved-mutation-intent`", report)
-
     def test_cli_rejects_fingerprinted_user_cache_outside_trusted_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1309,6 +1308,65 @@ class CliTest(unittest.TestCase):
                 "administrative artifact validation failed",
             )
             self.assertTrue(target_path.exists())
+
+    def test_cli_verify_is_matching_admin_intent_accounting_resolver(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "admin-resolve"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"cache")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:admin-resolve",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            from scripts.mac_cleanup.admin_script import generate_admin_script
+
+            script_path = session.path / "admin.zsh"
+            generate_admin_script(
+                batch,
+                script_path,
+                session.path / "admin-result.json",
+                trusted_home=home,
+            )
+            completed = subprocess.run(
+                (str(script_path),), capture_output=True, text=True, check=False
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIsNotNone(Session.load(session.path).mutation_intent())
+
+            code, output = self._run(
+                [
+                    "verify",
+                    "--session",
+                    str(session.path),
+                    "--batch",
+                    batch.id,
+                ],
+                trusted_home=home,
+            )
+
+            self.assertEqual(code, 0, output)
+            resolved = Session.load(session.path)
+            self.assertIsNone(resolved.mutation_intent())
+            self.assertEqual(resolved.status(target.id), "verified")
+            operations = read_json(session.path / "outcomes.json")["operations"]
+            self.assertEqual(
+                [operation["operation"] for operation in operations],
+                ["apply", "verify"],
+            )
 
     def test_outcome_write_failure_after_delete_leaves_durable_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

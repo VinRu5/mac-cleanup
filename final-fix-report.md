@@ -1,57 +1,55 @@
 # Final fix report
 
-- Base HEAD: `73ae5d5`
-- Final review findings addressed: session-directory and lock ingress hardening;
-  interrupted-removal accounting; unavailable cache-root detection; minimal
-  installation handoff allowlist.
-- Session safety: canonical descriptor-relative traversal rejects aliases and
-  symlinks before state mutation; existing session directories and lock objects are
-  never chmodded; lock owner, mode, link count, device, and inode are validated and
-  revalidated after `flock` while stable-inode retry, reentrancy, and fork cleanup
-  remain covered.
-- Accounting: interrupted exact removal persists an unknown aggregate plus explicit
-  uncertain target ids and issue; known successful target counts remain available;
-  strict durable validation and report rendering reject forged exact-zero records.
-- Post-removal checkpointing: failures while persisting `applied`, `verified`, or the
-  resulting critical stop are converted to a critical suspended outcome. The current
-  target remains accounting-unknown, completed earlier target counts are preserved,
-  and no speculative lifecycle transition or deletion retry is attempted.
-- Durable mutation/accounting protocol: authoritative `state.json` now records a
-  strict, operation/batch/target-bound intent immediately before the first exact
-  deletion. It survives deletion, lifecycle, free-space, outcome-publication, latch,
-  and final-checkpoint failures. Apply, verify, administrative paths, and reporting
-  check this authority before outcome reads or mutation, return the critical stop,
-  never retry or credit the uncertain target, and require a fresh session/rescan.
-- Two-phase completion: the CLI supplies the executor a narrow durable-outcome
-  callback. The intent is cleared only after that callback returns and the final
-  state checkpoint succeeds. Direct executor callers leave the intent unresolved by
-  default; a successful outcome write followed by a failed clear remains blocked and
-  is reported conservatively.
-- Conservative reporting: an unresolved intent takes precedence over missing,
-  malformed, or even successfully written outcome history. Removed logical bytes and
-  free-space recovery remain unknown, while the report names the uncertain target and
-  the required fresh-session recovery action.
-- Discovery: present but inaccessible cache roots remain detected and yield one
-  `user-caches.cache-root-unavailable` warning; absent roots remain undetected.
-- Installation handoff: only `SKILL.md`, `agents/`, `references/`, `scripts/`, and
-  required package files are allowlisted. Git metadata, `.superpowers`, reports,
-  bytecode caches, and session artifacts are excluded. No installation was performed.
+- Round-2 base HEAD: `d0eff60`.
+- Administrative mutation protocol: both the generated bootstrap and the
+  self-contained verifier reload state under the stable session lock and reject any
+  unresolved intent. Immediately before each destructive syscall, the verifier
+  writes and rereads an exact `admin_apply` intent bound to the batch, target, and
+  immutable operation digest. A crash before the result checkpoint leaves that
+  intent authoritative and reporting remains accounting-unknown.
+- Administrative resolution: only a matching result import (including CLI
+  `verify`) may validate the immutable binding, verified result record, and target
+  absence; publish the per-target apply outcome; and clear that exact intent last.
+  Publication failure or a nonmatching/direct intent leaves the session blocked.
+- Multi-target administrative batches advance one accounted target per run.
+  Verified targets are checksum-validated no-ops on the next run, while remaining
+  approved targets retain authorization. Regeneration, report guidance, accumulated
+  result checkpoints, and per-target outcome publication remain consistent across
+  rounds.
+- Atomic persistence: JSON and report-text writers set and validate owner/mode and
+  fsync temporary files before replacement; no fallible destination chmod remains.
+  Directory fsync follows replacement. Intent clearing rereads authoritative state
+  while the current lock is still asserted: a committed null intent is accepted,
+  while a present intent or pre-replace failure remains blocked.
+- State migration: newly written state uses strict schema v2. Strict legacy v1 state
+  without `mutation_intent` is accepted, migrated once under the session lock to v2
+  with a null intent, and preserves timestamps, manifests, targets, events, issues,
+  critical stops, and administrative bindings. Concurrent loads converge; committed
+  post-replace errors are reconciled, while pre-commit failures preserve v1.
+- Durable diagnostics: mutation intent schema v1 now carries canonical
+  `primary_issue` plus the optional exact administrative operation binding. Recovery
+  checkpoints the original diagnostic before latch/outcome publication. Issue
+  persistence and reports canonically deduplicate equivalent failures, so repeated
+  path-safety failures retain one exact `executor.symlink-or-outside` critical rather
+  than degrading to an outcome-publication error.
+- Lock and schema audit: current/legacy version fields reject booleans and non-integer
+  aliases; administrative intents must match the durable operation digest; bootstrap,
+  verifier, migration reconciliation, outcome publication, and final intent clear all
+  retain current-lock assertions at their authority boundaries.
 
 ## Verification
 
-- Targeted final-finding suite: 84 tests passed before the final lock self-review.
-- Post-review focused suite: session, executor, CLI, reporting, administrative, and
-  integration paths — 120 tests passed.
-- Full suite after all changes: `python3 -m unittest discover -s tests` — 160 tests
+- Focused round-2 suites (models, sessions, executor, administrative, CLI, reporting):
+  132 tests passed before the final multi-target/report audit.
+- Full suite after all changes: `python3 -m unittest discover -s tests` — 177 tests
   passed.
-- Integration suite: 2 tests passed.
-- Python compilation: all tracked Python files passed `py_compile`.
+- Integration suite: `python3 -m unittest tests.test_integration` — 2 tests passed.
+- Python compilation: every tracked Python file passed `py_compile`.
 - `git diff --check`: passed.
-- `quick_validate.py`: not runnable in the current interpreter because `PyYAML` is
-  unavailable (`ModuleNotFoundError: yaml`); no dependency was installed.
-- Untracked `__pycache__` directories were removed.
+- No dependency was installed and no skill installation was performed.
 - `.superpowers/sdd/2026-10-08-mac-cleanup-mvp/progress.md` was not modified.
 
 ## Self-review
 
-No remaining critical, important, or minor finding was identified in the final diff.
+No remaining critical, important, or minor finding was identified in the round-2
+diff.

@@ -1,8 +1,10 @@
+import copy
 import fcntl
 import multiprocessing
 import os
 import signal
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -104,6 +106,21 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(session.state["issues"][0]["code"], "OPTIONAL_TOOL_MISSING")
         for artifact in ("inventory.json", "policy.json", "manifest.json", "state.json"):
             self.assertEqual(os.stat(self.session_path / artifact).st_mode & 0o777, 0o600)
+
+    def test_report_text_has_no_fallible_post_replace_chmod(self) -> None:
+        session = Session.create(self.session_path)
+
+        with patch(
+            "scripts.mac_cleanup.sessions.os.chmod",
+            side_effect=OSError("post-replace chmod must not run"),
+        ) as chmod:
+            session.write_report("# Durable report\n")
+
+        chmod.assert_not_called()
+        self.assertEqual(
+            session.report_path.read_text(encoding="utf-8"), "# Durable report\n"
+        )
+        self.assertEqual(session.report_path.stat().st_mode & 0o777, 0o600)
 
     def test_create_rejects_noncanonical_or_symlinked_session_paths_before_writing(self) -> None:
         real_parent = self.root / "real-parent"
@@ -479,6 +496,157 @@ class SessionTest(unittest.TestCase):
         session.clear_mutation_intent(intent["operation_id"])
         self.assertIsNone(Session.load(self.session_path).mutation_intent())
 
+    def test_clear_reconciles_a_committed_write_after_directory_fsync_error(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        session.transition("cache-a", "approved")
+        intent = session.begin_mutation_intent(
+            operation="apply", batch_id="safe-caches", target_id="cache-a"
+        )
+        real_fsync = os.fsync
+        calls = 0
+
+        def fail_directory_fsync(descriptor: int) -> None:
+            nonlocal calls
+            calls += 1
+            real_fsync(descriptor)
+            if calls == 2:
+                raise OSError("simulated post-replace directory fsync failure")
+
+        with patch(
+            "scripts.mac_cleanup.jsonio.os.fsync", side_effect=fail_directory_fsync
+        ):
+            session.clear_mutation_intent(intent["operation_id"])
+
+        self.assertIsNone(Session.load(self.session_path).mutation_intent())
+
+    def test_clear_keeps_intent_when_replace_did_not_commit(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        session.transition("cache-a", "approved")
+        intent = session.begin_mutation_intent(
+            operation="apply", batch_id="safe-caches", target_id="cache-a"
+        )
+
+        with patch(
+            "scripts.mac_cleanup.jsonio.os.replace",
+            side_effect=OSError("simulated pre-commit replace failure"),
+        ):
+            with self.assertRaises(OSError):
+                session.clear_mutation_intent(intent["operation_id"])
+
+        self.assertEqual(Session.load(self.session_path).mutation_intent(), intent)
+
+    def test_legacy_v1_state_migrates_once_without_losing_bound_data(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        session.transition("cache-a", "approved")
+        session.add_issue(Issue("legacy.warning", Severity.WARNING, "preserve me"))
+        session.bind_admin_script("safe-caches", {"sentinel": "binding"})
+        legacy = read_json(session.state_path)
+        legacy["schema_version"] = 1
+        legacy.pop("mutation_intent")
+        preserved = copy.deepcopy(legacy)
+        atomic_write_json(session.state_path, legacy)
+
+        first = Session.load(self.session_path)
+        second = Session.load(self.session_path)
+
+        self.assertEqual(first.state["schema_version"], 2)
+        self.assertIsNone(first.mutation_intent())
+        self.assertEqual(first.read_manifest(), self.manifest)
+        self.assertEqual(
+            first.admin_script_binding("safe-caches"), {"sentinel": "binding"}
+        )
+        for key in (
+            "admin_scripts",
+            "created_at",
+            "critical_stop",
+            "events",
+            "issues",
+            "manifest",
+            "targets",
+        ):
+            self.assertEqual(first.state[key], preserved[key])
+        self.assertEqual(first.state, second.state)
+
+    def test_legacy_v1_schema_rejects_boolean_version(self) -> None:
+        session = Session.create(self.session_path)
+        legacy = read_json(session.state_path)
+        legacy["schema_version"] = True
+        legacy.pop("mutation_intent")
+        atomic_write_json(session.state_path, legacy)
+
+        with self.assertRaises(ValueError):
+            Session.load(self.session_path)
+
+    def test_legacy_migration_reconciles_committed_directory_fsync_error(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        legacy = read_json(session.state_path)
+        legacy["schema_version"] = 1
+        legacy.pop("mutation_intent")
+        atomic_write_json(session.state_path, legacy)
+        real_fsync = os.fsync
+        calls = 0
+
+        def fail_migration_directory_fsync(descriptor: int) -> None:
+            nonlocal calls
+            calls += 1
+            real_fsync(descriptor)
+            if calls == 2:
+                raise OSError("simulated committed migration fsync failure")
+
+        with patch(
+            "scripts.mac_cleanup.jsonio.os.fsync",
+            side_effect=fail_migration_directory_fsync,
+        ):
+            migrated = Session.load(self.session_path)
+
+        self.assertEqual(migrated.state["schema_version"], 2)
+        self.assertIsNone(migrated.mutation_intent())
+
+    def test_legacy_migration_preserves_v1_after_precommit_failure(self) -> None:
+        session = Session.create(self.session_path)
+        legacy = read_json(session.state_path)
+        legacy["schema_version"] = 1
+        legacy.pop("mutation_intent")
+        atomic_write_json(session.state_path, legacy)
+
+        with patch(
+            "scripts.mac_cleanup.jsonio.os.replace",
+            side_effect=OSError("simulated migration replace failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "migration replace failure"):
+                Session.load(self.session_path)
+
+        self.assertEqual(read_json(session.state_path), legacy)
+
+    def test_concurrent_legacy_v1_loads_converge_on_one_v2_state(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        legacy = read_json(session.state_path)
+        legacy["schema_version"] = 1
+        legacy.pop("mutation_intent")
+        atomic_write_json(session.state_path, legacy)
+        states: list[dict[str, object]] = []
+
+        threads = [
+            threading.Thread(
+                target=lambda: states.append(Session.load(self.session_path).state)
+            )
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(states), 2)
+        self.assertEqual(states[0], states[1])
+        self.assertEqual(states[0]["schema_version"], 2)
+
     def test_load_rejects_malformed_mutation_intent_schema(self) -> None:
         session = Session.create(self.session_path)
         session.write_manifest(self.manifest)
@@ -487,7 +655,9 @@ class SessionTest(unittest.TestCase):
             "batch_id": "safe-caches",
             "created_at": "2026-10-28T00:00:00.000000Z",
             "operation": "apply",
+            "operation_binding": None,
             "operation_id": "a" * 32,
+            "primary_issue": None,
             "schema_version": 1,
             "target_id": "cache-a",
         }
@@ -507,8 +677,32 @@ class SessionTest(unittest.TestCase):
                     Session.load(self.session_path)
         state["mutation_intent"] = None
         atomic_write_json(session.state_path, state)
+        self.assertIsNone(Session.load(self.session_path).mutation_intent())
         del state["mutation_intent"]
         atomic_write_json(session.state_path, state)
+        with self.assertRaises(ValueError):
+            Session.load(self.session_path)
+
+    def test_load_rejects_admin_intent_outside_exact_durable_binding(self) -> None:
+        session = Session.create(self.session_path)
+        session.write_manifest(self.manifest)
+        session.transition("cache-a", "approved")
+        session.bind_admin_script(
+            "safe-caches", {"operation_digest": "b" * 64}
+        )
+        state = read_json(session.state_path)
+        state["mutation_intent"] = {
+            "batch_id": "safe-caches",
+            "created_at": "2026-10-28T00:00:00.000000Z",
+            "operation": "admin_apply",
+            "operation_binding": "a" * 64,
+            "operation_id": "c" * 32,
+            "primary_issue": None,
+            "schema_version": 1,
+            "target_id": "cache-a",
+        }
+        atomic_write_json(session.state_path, state)
+
         with self.assertRaises(ValueError):
             Session.load(self.session_path)
 

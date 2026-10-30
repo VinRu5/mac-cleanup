@@ -189,18 +189,20 @@ def _apply_batch_locked(
         try:
             target_removed = remove_tree_exact(result.identity, roots)
         except PathSafetyError as error:
-            runtime_issues.append(_issue_from_safety_error(result.target, error))
-            runtime_issues.append(_removal_accounting_issue(result.target))
+            _append_issue_unique(
+                runtime_issues, _issue_from_safety_error(result.target, error)
+            )
+            _append_issue_unique(runtime_issues, _removal_accounting_issue(result.target))
             uncertain_target_ids.append(result.target.id)
             break
         except PermissionError as error:
-            runtime_issues.append(_permission_issue(result.target, error))
-            runtime_issues.append(_removal_accounting_issue(result.target))
+            _append_issue_unique(runtime_issues, _permission_issue(result.target, error))
+            _append_issue_unique(runtime_issues, _removal_accounting_issue(result.target))
             uncertain_target_ids.append(result.target.id)
             break
         except OSError as error:
-            runtime_issues.append(_os_issue(result.target, error))
-            runtime_issues.append(_removal_accounting_issue(result.target))
+            _append_issue_unique(runtime_issues, _os_issue(result.target, error))
+            _append_issue_unique(runtime_issues, _removal_accounting_issue(result.target))
             uncertain_target_ids.append(result.target.id)
             break
 
@@ -210,13 +212,17 @@ def _apply_batch_locked(
             if verification_issue is None:
                 session.transition(result.target.id, "verified")
         except PathSafetyError as error:
-            runtime_issues.append(_issue_from_safety_error(result.target, error))
-            runtime_issues.append(_removal_accounting_issue(result.target))
+            _append_issue_unique(
+                runtime_issues, _issue_from_safety_error(result.target, error)
+            )
+            _append_issue_unique(runtime_issues, _removal_accounting_issue(result.target))
             uncertain_target_ids.append(result.target.id)
             break
         except Exception as error:
-            runtime_issues.append(_lifecycle_checkpoint_issue(result.target, error))
-            runtime_issues.append(_removal_accounting_issue(result.target))
+            _append_issue_unique(
+                runtime_issues, _lifecycle_checkpoint_issue(result.target, error)
+            )
+            _append_issue_unique(runtime_issues, _removal_accounting_issue(result.target))
             uncertain_target_ids.append(result.target.id)
             break
 
@@ -232,7 +238,7 @@ def _apply_batch_locked(
         if intent is None:
             raise
         current = _intent_target(persisted, intent)
-        runtime_issues.append(_accounting_checkpoint_issue(current, error))
+        _append_issue_unique(runtime_issues, _accounting_checkpoint_issue(current, error))
         _mark_checkpoint_accounting_uncertain(
             current,
             runtime_issues,
@@ -243,6 +249,26 @@ def _apply_batch_locked(
         before = None
         after = None
     if runtime_issues:
+        if intent is not None:
+            primary = next(
+                (
+                    issue
+                    for issue in runtime_issues
+                    if issue.severity is Severity.CRITICAL
+                ),
+                runtime_issues[0],
+            )
+            try:
+                intent = session.record_mutation_intent_issue(
+                    str(intent["operation_id"]), primary
+                )
+            except Exception as error:
+                _append_issue_unique(
+                    runtime_issues,
+                    _lifecycle_checkpoint_issue(
+                        _intent_target(persisted, intent), error
+                    ),
+                )
         runtime = tuple(runtime_issues)
         try:
             if _has_severity(runtime, Severity.CRITICAL):
@@ -251,7 +277,9 @@ def _apply_batch_locked(
                 _record_new_issues(session, runtime)
                 _suspend_mutable_targets(session, persisted)
         except PathSafetyError as error:
-            runtime_issues.append(_issue_from_safety_error(result.target, error))
+            _append_issue_unique(
+                runtime_issues, _issue_from_safety_error(result.target, error)
+            )
             runtime = _mark_checkpoint_accounting_uncertain(
                 result.target,
                 runtime_issues,
@@ -260,7 +288,9 @@ def _apply_batch_locked(
             )
             removed = sum(count for _, count in removed_by_target)
         except Exception as error:
-            runtime_issues.append(_lifecycle_checkpoint_issue(result.target, error))
+            _append_issue_unique(
+                runtime_issues, _lifecycle_checkpoint_issue(result.target, error)
+            )
             runtime = _mark_checkpoint_accounting_uncertain(
                 result.target,
                 runtime_issues,
@@ -697,6 +727,9 @@ def _accounting_checkpoint_issue(target: Target, error: BaseException) -> Issue:
 
 
 def _unresolved_mutation_intent_issue(intent: dict[str, object]) -> Issue:
+    primary = intent.get("primary_issue")
+    if isinstance(primary, dict):
+        return Issue.from_dict(primary)
     return Issue(
         "executor.unresolved-mutation-intent",
         Severity.CRITICAL,
@@ -778,20 +811,21 @@ def _conservative_intent_outcome(
 ) -> BatchOutcome:
     target_id = str(intent["target_id"])
     issues = list(outcome.issues)
-    issues.append(Issue(code, Severity.CRITICAL, message, target_id))
+    _append_issue_unique(issues, Issue(code, Severity.CRITICAL, message, target_id))
     if not any(
         issue.code == "executor.removal-accounting-uncertain"
         and issue.target_id == target_id
         for issue in issues
     ):
-        issues.append(
+        _append_issue_unique(
+            issues,
             Issue(
                 "executor.removal-accounting-uncertain",
                 Severity.BATCH_ERROR,
                 "Exact removal may have completed without a durable accounting "
                 f"checkpoint for target: {target_id}",
                 target_id,
-            )
+            ),
         )
     return BatchOutcome(
         batch_id=outcome.batch_id,
@@ -830,8 +864,14 @@ def _mark_checkpoint_accounting_uncertain(
         and issue.target_id == target.id
         for issue in runtime_issues
     ):
-        runtime_issues.append(_removal_accounting_issue(target))
+        _append_issue_unique(runtime_issues, _removal_accounting_issue(target))
     return tuple(runtime_issues)
+
+
+def _append_issue_unique(issues: list[Issue], issue: Issue) -> None:
+    identity = issue.to_dict()
+    if not any(candidate.to_dict() == identity for candidate in issues):
+        issues.append(issue)
 
 
 def _in_use_issue(target: Target, error: BaseException) -> Issue:

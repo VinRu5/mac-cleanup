@@ -8,9 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.mac_cleanup.executor import apply_batch, preflight_target, verify_batch
+from scripts.mac_cleanup.jsonio import read_json
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Severity, Target
 from scripts.mac_cleanup.paths import PathSafetyError, inspect_path, remove_tree_exact
-from scripts.mac_cleanup.reporting import record_batch_outcome
+from scripts.mac_cleanup.reporting import record_batch_outcome, render_report
 from scripts.mac_cleanup.sessions import Session
 
 
@@ -562,6 +563,45 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn(
             "executor.lifecycle-checkpoint-failed",
             {issue.code for issue in outcome.issues},
+        )
+
+    def test_primary_path_safety_diagnostic_survives_transition_and_latch_failure(self) -> None:
+        target = self._target("cache-a")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+        failure = PathSafetyError("symlinks are not allowed")
+
+        with patch.object(
+            self.session, "transition", side_effect=failure
+        ), patch.object(self.session, "latch_critical", side_effect=failure):
+            outcome = apply_batch(
+                self.session,
+                batch,
+                (self.allowed_root,),
+                outcome_recorder=lambda value: record_batch_outcome(
+                    self.session, "apply", value
+                ),
+            )
+
+        safety = [
+            issue
+            for issue in outcome.issues
+            if issue.code == "executor.symlink-or-outside"
+        ]
+        self.assertEqual(len(safety), 1)
+        intent = Session.load(self.session.path).mutation_intent()
+        self.assertEqual(intent["primary_issue"], safety[0].to_dict())  # type: ignore[index]
+        report = render_report(Session.load(self.session.path))
+        self.assertEqual(report.count("`executor.symlink-or-outside`"), 1)
+        self.assertNotIn("executor.outcome-publication-failed", report)
+        persisted = read_json(self.session.path / "outcomes.json")["operations"][0]
+        self.assertEqual(
+            [
+                issue["code"]
+                for issue in persisted["issues"]
+                if issue["code"] == "executor.symlink-or-outside"
+            ],
+            ["executor.symlink-or-outside"],
         )
 
     def test_direct_apply_leaves_durable_intent_and_reload_never_retries(self) -> None:

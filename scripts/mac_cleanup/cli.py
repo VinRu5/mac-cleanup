@@ -280,7 +280,19 @@ def _verify(session_path: Path, batch_id: str, home: Path) -> int:
     try:
         with session.operation_lock():
             unresolved = session.mutation_intent()
-            if unresolved is not None:
+            binding = session.admin_script_binding(batch_id)
+            target_ids = binding.get("target_ids") if binding is not None else None
+            resolving_admin_intent = (
+                unresolved is not None
+                and binding is not None
+                and isinstance(target_ids, list)
+                and unresolved.get("operation") == "admin_apply"
+                and unresolved.get("batch_id") == batch_id
+                and unresolved.get("operation_binding")
+                == binding.get("operation_digest")
+                and unresolved.get("target_id") in target_ids
+            )
+            if unresolved is not None and not resolving_admin_intent:
                 return _critical_accounting_stop(
                     "verify",
                     batch_id,
@@ -289,8 +301,8 @@ def _verify(session_path: Path, batch_id: str, home: Path) -> int:
             existing = accounting_lock_loss_issue(session.state)
             if existing is not None:
                 return _critical_accounting_stop("verify", batch_id, existing)
-            validate_outcome_history(session)
-            binding = session.admin_script_binding(batch_id)
+            if not resolving_admin_intent:
+                validate_outcome_history(session)
             if binding is not None:
                 result_path = binding.get("result_path")
                 checksum = binding.get("checksum")
@@ -303,6 +315,9 @@ def _verify(session_path: Path, batch_id: str, home: Path) -> int:
                         result_path,
                         checksum,
                         trusted_home=home,
+                        outcome_recorder=lambda value: record_batch_outcome(
+                            session, "apply", value
+                        ),
                     )
                 except SessionConsistencyError:
                     raise
@@ -316,13 +331,20 @@ def _verify(session_path: Path, batch_id: str, home: Path) -> int:
                     )
                     return CRITICAL_SAFETY_FAILURE
                 session.assert_operation_lock_current()
+                remaining_intent = session.mutation_intent()
+                if remaining_intent is not None:
+                    return _critical_accounting_stop(
+                        "verify",
+                        batch_id,
+                        _unresolved_mutation_intent_issue(remaining_intent),
+                    )
                 critical = session.critical_issue()
                 if critical is not None:
                     _print_json({"batch_id": batch_id, "command": "verify", "critical_issue": critical.to_dict()})
                     return CRITICAL_SAFETY_FAILURE
                 batch = _named_batch(session, batch_id)
                 statuses = tuple(session.status(target.id) for target in batch.targets)
-                if any(status == "suspended" for status in statuses):
+                if any(status in {"approved", "suspended"} for status in statuses):
                     _print_json({"batch_id": batch_id, "command": "verify", "status": "suspended"})
                     return BATCH_SUSPENDED
             batch = _named_batch(session, batch_id)

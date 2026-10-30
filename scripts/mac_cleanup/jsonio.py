@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+import stat
 from typing import Any
 
 
@@ -23,8 +24,22 @@ def atomic_write_json(path: str | os.PathLike[str], value: object) -> None:
             handle.write(canonical_bytes(value))
             handle.flush()
             os.fsync(handle.fileno())
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise OSError("temporary JSON metadata is unsafe")
         os.replace(temporary, destination)
-        os.chmod(destination, 0o600)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        directory_fd = os.open(destination.parent, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(temporary)

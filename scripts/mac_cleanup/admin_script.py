@@ -12,9 +12,10 @@ import re
 import stat
 import sys
 import tempfile
+from collections.abc import Callable
 from typing import Mapping
 
-from .executor import _preflight_target
+from .executor import BatchOutcome, _preflight_target
 from .jsonio import canonical_bytes, read_json
 from .models import Batch, Issue, Risk, Severity
 from .sessions import Session
@@ -116,12 +117,15 @@ try:
         state=json.loads(read_regular_at(session_fd,"state.json","state",uid,gid,0o600).decode("utf-8"))
     except (UnicodeDecodeError,json.JSONDecodeError):
         fail("state is not JSON")
-    if not isinstance(state,dict) or set(state)!={"schema_version","created_at","admin_scripts","critical_stop","events","issues","manifest","mutation_intent","targets"} or state.get("schema_version")!=1:
+    if not isinstance(state,dict) or set(state)!={"schema_version","created_at","admin_scripts","critical_stop","events","issues","manifest","mutation_intent","targets"} or type(state.get("schema_version")) is not int or state.get("schema_version")!=2:
         fail("state schema is invalid")
     if not isinstance(state.get("created_at"),str) or not isinstance(state.get("events"),list) or not isinstance(state.get("issues"),list):
         fail("state fields are invalid")
-    if state.get("critical_stop") is not None or state.get("mutation_intent") is not None or not isinstance(state.get("targets"),dict) or state["targets"].get(target_id)!="approved":
-        fail("target is not currently approved")
+    if state.get("critical_stop") is not None or not isinstance(state.get("targets"),dict):
+        fail("session is not currently executable")
+    target_status=state["targets"].get(target_id)
+    if target_status not in {"approved","verified"}:
+        fail("target is not currently approved or verified")
     if any(not isinstance(key,str) or value not in {"pending","approved","applied","verified","suspended","skipped","failed"} for key,value in state["targets"].items()):
         fail("target states are invalid")
     scripts=state.get("admin_scripts")
@@ -159,12 +163,17 @@ try:
     operation={key:binding[key] for key in ("allowed_root","batch","checksum","manifest_digest","output_path","result_path","session_gid","session_path","session_uid","snapshot_digest","snapshot_path")}
     if not hmac.compare_digest(digest(canonical(operation)),binding["operation_digest"]):
         fail("operation binding changed")
+    intent=state.get("mutation_intent")
+    if intent is not None:
+        fail("session has an unresolved mutation intent")
     script_bytes=read_regular_at(session_fd,output_name,"script",uid,gid,0o700)
     if not hmac.compare_digest(digest(script_bytes),binding["checksum"]):
         fail("script checksum changed")
     snapshot_bytes=read_regular_at(session_fd,snapshot_name,"snapshot",uid,gid,0o600)
     if not hmac.compare_digest(digest(snapshot_bytes),binding["snapshot_digest"]):
         fail("snapshot digest changed")
+    if target_status=="verified":
+        sys.exit(0)
     snapshot_path=binding["snapshot_path"]
     target=target_matches[0]
     verifier_arguments=[session_path,snapshot_path,binding["snapshot_digest"],binding["output_path"],binding["result_path"],binding["operation_digest"],batch_id,canonical(target).decode("utf-8"),binding["allowed_root"],str(uid),str(gid),binding["manifest_digest"],target_id,target["path"],target["fingerprint"]]
@@ -327,12 +336,13 @@ def validate_admin_artifacts(
     This read-only engine check holds the stable session lock while validating the
     durable binding, current script and snapshot bytes, metadata, manifest, batch,
     lifecycle authorization, trusted root, and critical latch.  The default mode
-    requires every target to remain approved before manual use.  Reporting passes
-    ``require_approved=False`` to audit integrity after later lifecycle transitions;
-    that read-only mode does not authorize execution.  The caller must present and
-    the human must confirm ``checksum`` and execute that exact script.  This check
-    does not close the later manual-execution time gap against a malicious same-UID
-    actor.
+    requires at least one approved target and permits only approved or already
+    verified targets, so a multi-target batch can resume after each accounted
+    administrative mutation.  Reporting passes ``require_approved=False`` to audit
+    integrity after later lifecycle transitions; that read-only mode does not
+    authorize execution.  The caller must present and the human must confirm
+    ``checksum`` and execute that exact script.  This check does not close the later
+    manual-execution time gap against a malicious same-UID actor.
     """
     if not isinstance(session, Session):
         raise TypeError("session must be a Session")
@@ -454,7 +464,8 @@ def import_admin_results(
     expected_checksum: str,
     *,
     trusted_home: Path | None = None,
-) -> None:
+    outcome_recorder: Callable[[BatchOutcome], None] | None = None,
+) -> BatchOutcome | None:
     """Post-validate artifacts/results and import verified filesystem outcomes."""
     if not isinstance(session, Session):
         raise TypeError("session must be a Session")
@@ -469,8 +480,7 @@ def import_admin_results(
     allowed_root = _trusted_cache_root(home)
 
     with session.operation_lock():
-        if session.mutation_intent() is not None:
-            raise ValueError("session has an unresolved mutation intent")
+        intent = session.mutation_intent()
         if session.critical_issue() is not None:
             raise ValueError("session has a critical safety stop")
         bindings = _admin_bindings(session)
@@ -483,6 +493,14 @@ def import_admin_results(
             raise ValueError("result path has no unique administrative binding")
         binding = matches[0]
         _validate_binding(binding)
+        if intent is not None and (
+            intent.get("operation") != "admin_apply"
+            or intent.get("batch_id") != binding["batch_id"]
+            or intent.get("operation_binding") != binding["operation_digest"]
+            or intent.get("target_id") not in binding["target_ids"]
+            or intent.get("primary_issue") is not None
+        ):
+            raise ValueError("session has an unrelated mutation intent")
         if binding["session_path"] != str(session.path):
             raise ValueError("administrative binding targets a different session")
         if not hmac.compare_digest(binding["checksum"], expected_checksum):
@@ -553,7 +571,43 @@ def import_admin_results(
             "targets": {},
         }
         records = _validate_result_binding(results, expected_result)
+        if intent is not None:
+            target_id = str(intent["target_id"])
+            target = next(
+                (item for item in persisted.targets if item.id == target_id), None
+            )
+            if target is None:
+                raise ValueError("administrative intent target is outside its batch")
+            record = records.get(target_id)
+            if record is None or record.get("status") != "verified":
+                raise ValueError("administrative intent has no verified result")
+            preflight = _preflight_target(target, (allowed_root,))
+            if not any(
+                issue.code == "executor.target-absent"
+                for issue in preflight.issues
+            ):
+                raise ValueError("administrative intent postcondition is not absent")
+            imported_issues = tuple(
+                Issue.from_dict(value)
+                for value in record["issues"]  # type: ignore[index]
+            )
+            _transition_verified(session, target_id)
+            removed = int(record["logical_bytes_removed"])
+            outcome = BatchOutcome(
+                batch_id=persisted.id,
+                issues=imported_issues,
+                logical_bytes_removed=removed,
+                logical_bytes_removed_by_target=((target_id, removed),),
+                free_space_before=None,
+                free_space_after=None,
+            )
+            if outcome_recorder is None:
+                return outcome
+            outcome_recorder(outcome)
+            session.clear_mutation_intent(str(intent["operation_id"]))
+            return outcome
         _import_target_records(session, persisted, records, allowed_root)
+        return None
 
 
 def _render_script(
@@ -654,9 +708,16 @@ def _approved_session_batch(session: Session, supplied: Batch) -> Batch:
     persisted = _named_batch(session, supplied.id)
     if persisted != supplied:
         raise ValueError("batch must exactly match the immutable session manifest")
+    has_approved = False
     for target in persisted.targets:
-        if session.status(target.id) != "approved":
-            raise ValueError(f"administrative target is not approved: {target.id}")
+        status = session.status(target.id)
+        if status not in {"approved", "verified"}:
+            raise ValueError(
+                f"administrative target is not approved or verified: {target.id}"
+            )
+        has_approved = has_approved or status == "approved"
+    if not has_approved:
+        raise ValueError("administrative batch has no approved target")
     return persisted
 
 

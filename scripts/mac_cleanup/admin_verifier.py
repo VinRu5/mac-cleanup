@@ -15,6 +15,7 @@ import os
 import secrets
 import stat
 import sys
+from datetime import datetime, timezone
 
 
 RESULT_SCHEMA_VERSION = 1
@@ -323,6 +324,23 @@ def _atomic_write_json_owned(
 
 
 def _validate_manifest_record(state: dict[str, object]) -> dict[str, object]:
+    expected = {
+        "admin_scripts",
+        "created_at",
+        "critical_stop",
+        "events",
+        "issues",
+        "manifest",
+        "mutation_intent",
+        "schema_version",
+        "targets",
+    }
+    if (
+        set(state) != expected
+        or type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 2
+    ):
+        raise SafetyError("state schema is invalid", critical=True)
     record = state.get("manifest")
     if not isinstance(record, dict) or set(record) != {
         "digest",
@@ -387,6 +405,7 @@ def _validate_binding(
     session_uid: int,
     session_gid: int,
     target: dict[str, object],
+    expected_intent: dict[str, object] | None = None,
 ) -> dict[str, object]:
     scripts = state.get("admin_scripts")
     if not isinstance(scripts, dict):
@@ -458,7 +477,52 @@ def _validate_binding(
         raise SafetyError("administrative target is no longer approved", critical=True)
     if state.get("critical_stop") is not None:
         raise SafetyError("session has a critical safety stop", critical=True)
+    if state.get("mutation_intent") != expected_intent:
+        raise SafetyError("session has an unrelated mutation intent", critical=True)
     return binding
+
+
+def _new_admin_intent(
+    batch_id: str, target_id: str, operation_digest: str
+) -> dict[str, object]:
+    return {
+        "batch_id": batch_id,
+        "created_at": datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        "operation": "admin_apply",
+        "operation_binding": operation_digest,
+        "operation_id": secrets.token_hex(16),
+        "primary_issue": None,
+        "schema_version": 1,
+        "target_id": target_id,
+    }
+
+
+def _record_intent_issue(
+    session_fd: int,
+    lock_fd: int,
+    intent: dict[str, object],
+    issue: dict[str, object],
+    uid: int,
+    gid: int,
+) -> None:
+    _require_current_lock(session_fd, lock_fd)
+    state = _read_json_at(
+        session_fd, "state.json", "state", owner=uid, group=gid, mode=0o600
+    )
+    _validate_manifest_record(state)
+    if state.get("mutation_intent") != intent:
+        raise SafetyError("mutation intent changed", critical=True)
+    if intent.get("primary_issue") is not None:
+        return
+    next_intent = dict(intent)
+    next_intent["primary_issue"] = issue
+    next_state = json.loads(_canonical_bytes(state).decode("utf-8"))
+    next_state["mutation_intent"] = next_intent
+    _atomic_write_json_owned_at(session_fd, "state.json", next_state, uid, gid)
+    intent.clear()
+    intent.update(next_intent)
 
 
 def _validate_result(
@@ -771,6 +835,7 @@ def _run(arguments: tuple[str, ...]) -> int:
     result_name: str | None = None
     uid = -1
     gid = -1
+    intent: dict[str, object] | None = None
     try:
         if not _is_sha256(snapshot_digest) or not _is_sha256(operation_digest):
             raise SafetyError("generated digests are invalid", critical=True)
@@ -933,6 +998,45 @@ def _run(arguments: tuple[str, ...]) -> int:
             raise SafetyError(
                 "administrative script checksum changed", critical=True
             )
+        intent = _new_admin_intent(
+            batch_id, str(target["id"]), operation_digest
+        )
+        next_state = json.loads(_canonical_bytes(current_state).decode("utf-8"))
+        next_state["mutation_intent"] = intent
+        _atomic_write_json_owned_at(session_fd, "state.json", next_state, uid, gid)
+        committed_state = _read_json_at(
+            session_fd, "state.json", "state", owner=uid, group=gid, mode=0o600
+        )
+        committed_manifest = _validate_manifest_record(committed_state)
+        _validate_binding(
+            committed_state,
+            committed_manifest,
+            batch_id,
+            operation_digest,
+            snapshot_path,
+            snapshot_digest,
+            script_path,
+            result_path,
+            allowed_root,
+            uid,
+            gid,
+            target,
+            expected_intent=intent,
+        )
+        committed_script = _read_regular_at(
+            session_fd,
+            script_name,
+            "script",
+            owner=uid,
+            group=gid,
+            mode=0o700,
+        )
+        if not hmac.compare_digest(
+            _sha256(committed_script), str(current_binding["checksum"])
+        ):
+            raise SafetyError(
+                "administrative script checksum changed", critical=True
+            )
         _require_current_lock(session_fd, lock_fd)
         if target_kind == "directory":
             _remove_directory_exact(root_fd, name, target_fd)
@@ -967,6 +1071,13 @@ def _run(arguments: tuple[str, ...]) -> int:
             severity = "critical" if error.critical else "batch_error"
             code = "paths.unsafe-target" if error.critical else "executor.target-changed"
             issue = _issue(code, severity, str(error), target.get("id"))
+            if intent is not None:
+                try:
+                    _record_intent_issue(
+                        session_fd, lock_fd, intent, issue, uid, gid
+                    )
+                except BaseException:
+                    pass
             try:
                 _checkpoint(
                     session_fd,
@@ -997,6 +1108,13 @@ def _run(arguments: tuple[str, ...]) -> int:
                 f"Filesystem operation failed: {error}",
                 target.get("id"),
             )
+            if intent is not None:
+                try:
+                    _record_intent_issue(
+                        session_fd, lock_fd, intent, issue, uid, gid
+                    )
+                except BaseException:
+                    pass
             try:
                 _checkpoint(
                     session_fd,
