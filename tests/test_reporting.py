@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 import copy
+import threading
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.mac_cleanup.admin_script import generate_admin_script
 from scripts.mac_cleanup.executor import BatchOutcome
@@ -396,6 +398,200 @@ class ReportingTest(unittest.TestCase):
                     ),
                 )
             self.assertFalse((self.session.path / "outcomes.json").exists())
+
+    def test_outcome_publication_is_idempotent_and_conflicts_fail_closed(self) -> None:
+        target = Target(
+            id="user-caches:idempotent",
+            path=str(self.root / "home" / "Library" / "Caches" / "idempotent"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch("safe-user-caches", (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        operation_id = "1" * 32
+        outcome = BatchOutcome(
+            batch_id="safe-user-caches",
+            logical_bytes_removed=5,
+            logical_bytes_removed_by_target=((target.id, 5),),
+        )
+
+        first = record_batch_outcome(
+            self.session, "apply", outcome, operation_id=operation_id
+        )
+        repeated = record_batch_outcome(
+            Session.load(self.session.path),
+            "apply",
+            outcome,
+            operation_id=operation_id,
+        )
+
+        self.assertEqual(repeated, first)
+        document = read_json(self.session.path / "outcomes.json")
+        self.assertEqual(document["schema_version"], 2)
+        self.assertEqual(len(document["operations"]), 1)
+        self.assertEqual(document["operations"][0]["operation_id"], operation_id)
+        with self.assertRaises(ValueError):
+            record_batch_outcome(
+                self.session,
+                "apply",
+                BatchOutcome(batch_id="safe-user-caches"),
+                operation_id=operation_id,
+            )
+        self.assertEqual(
+            len(read_json(self.session.path / "outcomes.json")["operations"]), 1
+        )
+
+    def test_post_replace_error_is_reconciled_but_pre_replace_error_is_not(self) -> None:
+        target = Target(
+            id="user-caches:reconcile",
+            path=str(self.root / "home" / "Library" / "Caches" / "reconcile"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch("safe-user-caches", (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        outcome = BatchOutcome(
+            batch_id="safe-user-caches",
+            logical_bytes_removed=5,
+            logical_bytes_removed_by_target=((target.id, 5),),
+        )
+        from scripts.mac_cleanup.jsonio import atomic_write_json as real_write
+
+        def publish_then_fail(path: Path, value: object) -> None:
+            real_write(path, value)
+            raise OSError("simulated directory fsync failure")
+
+        with patch(
+            "scripts.mac_cleanup.reporting.atomic_write_json",
+            side_effect=publish_then_fail,
+        ):
+            receipt = record_batch_outcome(
+                self.session, "apply", outcome, operation_id="2" * 32
+            )
+        self.assertEqual(receipt.operation_id, "2" * 32)
+        self.assertEqual(
+            len(read_json(self.session.path / "outcomes.json")["operations"]), 1
+        )
+
+        with patch(
+            "scripts.mac_cleanup.reporting.atomic_write_json",
+            side_effect=OSError("simulated pre-replace failure"),
+        ), self.assertRaises(OSError):
+            record_batch_outcome(
+                self.session, "apply", outcome, operation_id="3" * 32
+            )
+        self.assertEqual(
+            len(read_json(self.session.path / "outcomes.json")["operations"]), 1
+        )
+
+    def test_concurrent_same_operation_id_is_recorded_once(self) -> None:
+        target = Target(
+            id="user-caches:concurrent",
+            path=str(self.root / "home" / "Library" / "Caches" / "concurrent"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch("safe-user-caches", (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        outcome = BatchOutcome(
+            batch_id="safe-user-caches",
+            logical_bytes_removed=5,
+            logical_bytes_removed_by_target=((target.id, 5),),
+        )
+        receipts: list[object] = []
+
+        def publish() -> None:
+            receipts.append(
+                record_batch_outcome(
+                    Session.load(self.session.path),
+                    "apply",
+                    outcome,
+                    operation_id="4" * 32,
+                )
+            )
+
+        threads = [threading.Thread(target=publish) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(receipts[0], receipts[1])
+        self.assertEqual(
+            len(read_json(self.session.path / "outcomes.json")["operations"]), 1
+        )
+
+    def test_legacy_outcomes_migrate_once_under_concurrent_load(self) -> None:
+        target = Target(
+            id="user-caches:legacy",
+            path=str(self.root / "home" / "Library" / "Caches" / "legacy"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch("safe-user-caches", (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        record_batch_outcome(
+            self.session,
+            "apply",
+            BatchOutcome(
+                batch_id="safe-user-caches",
+                logical_bytes_removed=5,
+                logical_bytes_removed_by_target=((target.id, 5),),
+            ),
+            operation_id="5" * 32,
+        )
+        path = self.session.path / "outcomes.json"
+        legacy = read_json(path)
+        legacy["schema_version"] = 1
+        legacy["operations"][0].pop("operation_id")
+        atomic_write_json(path, legacy)
+        reports: list[str] = []
+
+        def load_report() -> None:
+            reports.append(render_report(Session.load(self.session.path)))
+
+        threads = [threading.Thread(target=load_report) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(reports[0], reports[1])
+        migrated = read_json(path)
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertRegex(migrated["operations"][0]["operation_id"], r"^[0-9a-f]{64}$")
+
+        duplicate = copy.deepcopy(migrated["operations"][0])
+        duplicate["sequence"] = 2
+        migrated["operations"].append(duplicate)
+        atomic_write_json(path, migrated)
+        with self.assertRaises(ValueError):
+            render_report(self.session)
 
     def test_unresolved_intent_report_ignores_missing_or_malformed_outcomes(self) -> None:
         target = Target(

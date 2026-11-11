@@ -12,6 +12,7 @@ import shutil
 import stat
 
 from .models import Batch, Issue, Severity, Target
+from .outcome_store import verify_outcome_receipt
 from .paths import PathIdentity, PathSafetyError, inspect_path, remove_tree_exact
 from .sessions import Session, SessionConsistencyError
 
@@ -65,7 +66,7 @@ def apply_batch(
     allowed_roots: Iterable[str | os.PathLike[str]],
     *,
     dry_run: bool = False,
-    outcome_recorder: Callable[[BatchOutcome], None] | None = None,
+    outcome_recorder: Callable[[BatchOutcome, str | None], object] | None = None,
 ) -> BatchOutcome:
     """Preflight and apply a batch under a durable mutation/accounting intent.
 
@@ -90,7 +91,7 @@ def _apply_batch_locked(
     roots: tuple[str | os.PathLike[str], ...],
     *,
     dry_run: bool,
-    outcome_recorder: Callable[[BatchOutcome], None] | None,
+    outcome_recorder: Callable[[BatchOutcome, str | None], object] | None,
 ) -> BatchOutcome:
     unresolved = session.mutation_intent()
     if unresolved is not None:
@@ -766,14 +767,22 @@ def _finalize_apply_outcome(
     session: Session,
     outcome: BatchOutcome,
     intent: dict[str, object] | None,
-    outcome_recorder: Callable[[BatchOutcome], None] | None,
+    outcome_recorder: Callable[[BatchOutcome, str | None], object] | None,
     *,
     clear_allowed: bool,
 ) -> BatchOutcome:
     if outcome_recorder is None:
         return outcome
+    operation_id = str(intent["operation_id"]) if intent is not None else None
     try:
-        outcome_recorder(outcome)
+        receipt = outcome_recorder(outcome, operation_id)
+        verify_outcome_receipt(
+            session,
+            receipt,
+            operation="apply",
+            outcome=outcome,
+            operation_id=operation_id,
+        )
     except SessionConsistencyError:
         raise
     except Exception as error:

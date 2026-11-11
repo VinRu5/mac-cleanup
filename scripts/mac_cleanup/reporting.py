@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 from pathlib import Path
+import re
 from typing import Any
 
 from .admin_script import AdminArtifactValidation, validate_admin_artifacts
 from .executor import BatchOutcome, _unresolved_mutation_intent_issue
-from .jsonio import atomic_write_json, read_json
+from .jsonio import atomic_write_json, canonical_bytes, read_json
 from .models import Issue, Manifest, Severity
+from .outcome_store import (
+    OutcomePublicationReceipt,
+    outcome_operation_id,
+    receipt_for_record,
+)
 from .sessions import Session, SessionConsistencyError
 
 
-OUTCOMES_SCHEMA_VERSION = 1
+OUTCOMES_SCHEMA_VERSION = 2
+_LEGACY_OUTCOMES_SCHEMA_VERSION = 1
+_OPERATION_ID = re.compile(r"(?:[0-9a-f]{32}|[0-9a-f]{64})")
 ACCOUNTING_LOCK_LOST_CODE = "reporting.accounting-lock-lost"
 _SEVERITY_ORDER = tuple(severity.value for severity in Severity)
 
@@ -54,15 +63,26 @@ def validate_outcome_history(session: Session) -> None:
 
 
 def record_batch_outcome(
-    session: Session, operation: str, outcome: BatchOutcome
-) -> None:
-    """Append one CLI engine result without changing authoritative lifecycle state."""
+    session: Session,
+    operation: str,
+    outcome: BatchOutcome,
+    *,
+    operation_id: str | None = None,
+) -> OutcomePublicationReceipt:
+    """Idempotently publish one result and return its revalidated receipt."""
     if operation not in {"apply", "verify"}:
         raise ValueError("outcome operation must be apply or verify")
     if not isinstance(outcome, BatchOutcome):
         raise TypeError("outcome must be a BatchOutcome")
     if outcome.dry_run is not False:
         raise ValueError("dry-run outcomes must never be persisted")
+    stable_id = (
+        operation_id
+        if operation_id is not None
+        else outcome_operation_id(operation, outcome)
+    )
+    if not isinstance(stable_id, str) or not _OPERATION_ID.fullmatch(stable_id):
+        raise ValueError("outcome operation_id is invalid")
     with session.operation_lock():
         manifest = session.read_manifest()
         _validate_outcome_membership(manifest, outcome)
@@ -70,12 +90,52 @@ def record_batch_outcome(
         document = _read_outcome_document(session)
         operations = document["operations"]
         assert isinstance(operations, list)
-        value = _outcome_value(len(operations) + 1, operation, outcome)
+        existing = [item for item in operations if item["operation_id"] == stable_id]
+        if existing:
+            if len(existing) != 1:
+                raise ValueError("outcome operation_id is not unique")
+            value = _outcome_value(
+                int(existing[0]["sequence"]),
+                operation,
+                outcome,
+                operation_id=stable_id,
+            )
+            if existing[0] != value:
+                raise ValueError("outcome operation_id conflicts with durable accounting")
+            return receipt_for_record(value)
+        value = _outcome_value(
+            len(operations) + 1,
+            operation,
+            outcome,
+            operation_id=stable_id,
+        )
         _validate_outcome(value, len(operations) + 1)
         operations.append(value)
         _assert_outcome_lock_current(session)
-        atomic_write_json(path, document)
-        _assert_outcome_lock_current(session)
+        try:
+            atomic_write_json(path, document)
+            _assert_outcome_lock_current(session)
+        except Exception:
+            _assert_outcome_lock_current(session)
+            durable = _read_outcome_document(session)
+            durable_operations = durable["operations"]
+            assert isinstance(durable_operations, list)
+            matches = [
+                item for item in durable_operations
+                if item["operation_id"] == stable_id
+            ]
+            if len(matches) == 1 and matches[0] == value:
+                return receipt_for_record(value)
+            raise
+        durable = _read_outcome_document(session)
+        durable_operations = durable["operations"]
+        assert isinstance(durable_operations, list)
+        matches = [
+            item for item in durable_operations if item["operation_id"] == stable_id
+        ]
+        if len(matches) != 1 or matches[0] != value:
+            raise ValueError("published outcome has no exact durable record")
+        return receipt_for_record(value)
 
 
 def render_report(
@@ -229,11 +289,45 @@ def _read_outcome_document(session: Session) -> dict[str, object]:
     if not path.exists():
         return {"schema_version": OUTCOMES_SCHEMA_VERSION, "operations": []}
     _assert_outcome_lock_current(session)
+    value = read_json(path)
+    if value.get("schema_version") == _LEGACY_OUTCOMES_SCHEMA_VERSION:
+        legacy = _read_outcomes(path, schema_version=_LEGACY_OUTCOMES_SCHEMA_VERSION)
+        operations = legacy["operations"]
+        assert isinstance(operations, list)
+        migrated_operations: list[dict[str, object]] = []
+        for item in operations:
+            migrated = dict(item)
+            migrated["operation_id"] = hashlib.sha256(
+                canonical_bytes({"legacy_outcome": item})
+            ).hexdigest()
+            migrated_operations.append(migrated)
+        migrated_document: dict[str, object] = {
+            "schema_version": OUTCOMES_SCHEMA_VERSION,
+            "operations": migrated_operations,
+        }
+        _validate_outcome_document(migrated_document)
+        try:
+            atomic_write_json(path, migrated_document)
+            _assert_outcome_lock_current(session)
+        except Exception:
+            _assert_outcome_lock_current(session)
+            try:
+                durable = _read_outcomes(path)
+            except (OSError, ValueError):
+                raise
+            if durable == migrated_document:
+                return durable
+            raise
+        return _read_outcomes(path)
     return _read_outcomes(path)
 
 
 def _outcome_value(
-    sequence: int, operation: str, outcome: BatchOutcome
+    sequence: int,
+    operation: str,
+    outcome: BatchOutcome,
+    *,
+    operation_id: str,
 ) -> dict[str, object]:
     removed = sorted(outcome.logical_bytes_removed_by_target)
     return {
@@ -255,6 +349,7 @@ def _outcome_value(
             for target_id, count in removed
         ],
         "operation": operation,
+        "operation_id": operation_id,
         "regenerated_bytes": outcome.regenerated_bytes,
         "regenerated_target_ids": sorted(outcome.regenerated_target_ids),
         "sequence": sequence,
@@ -263,24 +358,36 @@ def _outcome_value(
     }
 
 
-def _read_outcomes(path: Path) -> dict[str, object]:
+def _read_outcomes(
+    path: Path, *, schema_version: int = OUTCOMES_SCHEMA_VERSION
+) -> dict[str, object]:
     value = read_json(path)
+    _validate_outcome_document(value, schema_version=schema_version)
+    return value
+
+
+def _validate_outcome_document(
+    value: dict[str, object], *, schema_version: int = OUTCOMES_SCHEMA_VERSION
+) -> None:
     if set(value) != {"schema_version", "operations"}:
         raise ValueError("outcomes fields do not match schema")
     if (
         type(value["schema_version"]) is not int
-        or value["schema_version"] != OUTCOMES_SCHEMA_VERSION
+        or value["schema_version"] != schema_version
     ):
-        raise ValueError("outcomes schema_version must be 1")
+        raise ValueError(f"outcomes schema_version must be {schema_version}")
     operations = value["operations"]
     if not isinstance(operations, list):
         raise ValueError("outcomes operations must be a list")
     for index, item in enumerate(operations, start=1):
-        _validate_outcome(item, index)
-    return value
+        _validate_outcome(item, index, legacy=schema_version == 1)
+    if schema_version == OUTCOMES_SCHEMA_VERSION:
+        operation_ids = [item["operation_id"] for item in operations]
+        if len(operation_ids) != len(set(operation_ids)):
+            raise ValueError("outcome operation ids must be unique")
 
 
-def _validate_outcome(value: object, sequence: int) -> None:
+def _validate_outcome(value: object, sequence: int, *, legacy: bool = False) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("outcome must be an object")
     expected = {
@@ -290,12 +397,19 @@ def _validate_outcome(value: object, sequence: int) -> None:
         "regenerated_target_ids", "sequence", "suspended",
         "uncertain_target_ids",
     }
+    if not legacy:
+        expected.add("operation_id")
     if (
         set(value) != expected
         or type(value["sequence"]) is not int
         or value["sequence"] != sequence
     ):
         raise ValueError("outcome fields or sequence do not match schema")
+    if not legacy and (
+        not isinstance(value["operation_id"], str)
+        or not _OPERATION_ID.fullmatch(value["operation_id"])
+    ):
+        raise ValueError("outcome operation_id is invalid")
     if value["operation"] not in {"apply", "verify"}:
         raise ValueError("outcome operation is invalid")
     if not isinstance(value["batch_id"], str) or not value["batch_id"]:

@@ -1,6 +1,7 @@
 # Final fix report
 
-- Round-2 base HEAD: `d0eff60`.
+- Durable-outcome correction base HEAD: `67c9be6` (the original round-2 base was
+  `d0eff60`).
 - Administrative mutation protocol: both the generated bootstrap and the
   self-contained verifier reload state under the stable session lock and reject any
   unresolved intent. Immediately before each destructive syscall, the verifier
@@ -36,12 +37,22 @@
   aliases; administrative intents must match the durable operation digest; bootstrap,
   verifier, migration reconciliation, outcome publication, and final intent clear all
   retain current-lock assertions at their authority boundaries.
+- Durable outcome boundary: outcome schema v2 binds every record to a unique stable
+  operation id. Mutation-backed apply/import uses the exact durable intent id; ordinary
+  verification uses a canonical deterministic id. Exact retries return the same
+  revalidated receipt, conflicting reuse fails closed, and post-replacement write
+  errors are reconciled by rereading the strict artifact under the current lock.
+  Legacy outcome schema v1 migrates deterministically and atomically under that lock.
+- Receipt-gated intent resolution: direct apply and administrative import independently
+  verify the recorder's receipt against the current `outcomes.json` record before
+  clearing an intent. A missing/no-op/forged recorder result, a pre-replacement error,
+  or `outcome_recorder=None` cannot clear it. The administrative reviewer reproduction
+  (post-replace directory-fsync error followed by retry) records removed bytes exactly
+  once and clears only after the durable receipt is proven.
 
 ## Verification
 
-- Focused round-2 suites (models, sessions, executor, administrative, CLI, reporting):
-  132 tests passed before the final multi-target/report audit.
-- Full suite after all changes: `python3 -m unittest discover -s tests` — 177 tests
+- Full suite after all changes: `python3 -m unittest discover -s tests` — 185 tests
   passed.
 - Integration suite: `python3 -m unittest tests.test_integration` — 2 tests passed.
 - Python compilation: every tracked Python file passed `py_compile`.

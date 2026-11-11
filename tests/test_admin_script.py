@@ -17,6 +17,7 @@ from scripts.mac_cleanup.admin_script import (
     validate_admin_artifacts,
 )
 from scripts.mac_cleanup.executor import apply_batch
+from scripts.mac_cleanup.jsonio import read_json
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Target
 from scripts.mac_cleanup.paths import inspect_path
 from scripts.mac_cleanup.reporting import record_batch_outcome, render_report
@@ -219,11 +220,16 @@ class AdminScriptTest(unittest.TestCase):
         self.assertIn("Removed logical bytes: unknown", report)
         observed_intents: list[dict[str, object]] = []
 
-        def publish(value: object) -> None:
+        def publish(value: object, operation_id: str | None) -> object:
             current = reloaded.mutation_intent()
             self.assertIsNotNone(current)
             observed_intents.append(current)  # type: ignore[arg-type]
-            record_batch_outcome(reloaded, "apply", value)  # type: ignore[arg-type]
+            return record_batch_outcome(
+                reloaded,
+                "apply",
+                value,  # type: ignore[arg-type]
+                operation_id=operation_id,
+            )
 
         outcome = import_admin_results(
             reloaded,
@@ -236,6 +242,73 @@ class AdminScriptTest(unittest.TestCase):
         self.assertEqual(len(observed_intents), 1)
         self.assertIsNone(Session.load(self.session.path).mutation_intent())
         self.assertEqual(reloaded.status(target.id), "verified")
+
+    def test_noop_outcome_recorder_cannot_clear_admin_intent(self) -> None:
+        target = self._target("noop-recorder")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        checksum, script_path, result_path = self._generate(batch)
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        with self.assertRaises(ValueError):
+            import_admin_results(
+                self.session,
+                result_path,
+                checksum,
+                trusted_home=self.home,
+                outcome_recorder=lambda _value, _operation_id: None,
+            )
+
+        self.assertIsNotNone(Session.load(self.session.path).mutation_intent())
+        self.assertFalse((self.session.path / "outcomes.json").exists())
+
+    def test_pre_replace_outcome_failure_leaves_admin_intent_for_retry(self) -> None:
+        target = self._target("pre-replace")
+        batch = Batch("safe-user-caches", (target,))
+        self._register(batch)
+        checksum, script_path, result_path = self._generate(batch)
+        completed = subprocess.run(
+            (str(script_path),), capture_output=True, text=True, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        def publish(value: object, operation_id: str | None) -> object:
+            return record_batch_outcome(
+                self.session,
+                "apply",
+                value,  # type: ignore[arg-type]
+                operation_id=operation_id,
+            )
+
+        with patch(
+            "scripts.mac_cleanup.reporting.atomic_write_json",
+            side_effect=OSError("simulated pre-replace publication failure"),
+        ), self.assertRaises(OSError):
+            import_admin_results(
+                self.session,
+                result_path,
+                checksum,
+                trusted_home=self.home,
+                outcome_recorder=publish,
+            )
+        self.assertIsNotNone(Session.load(self.session.path).mutation_intent())
+        self.assertFalse((self.session.path / "outcomes.json").exists())
+
+        outcome = import_admin_results(
+            self.session,
+            result_path,
+            checksum,
+            trusted_home=self.home,
+            outcome_recorder=publish,
+        )
+        self.assertIsNotNone(outcome)
+        self.assertIsNone(Session.load(self.session.path).mutation_intent())
+        self.assertEqual(
+            len(read_json(self.session.path / "outcomes.json")["operations"]), 1
+        )
 
     def test_bootstrap_and_verifier_reject_unrelated_intent_before_delete(self) -> None:
         target = self._target("approved")
@@ -337,8 +410,8 @@ class AdminScriptTest(unittest.TestCase):
             result_path,
             checksum,
             trusted_home=self.home,
-            outcome_recorder=lambda value: record_batch_outcome(
-                self.session, "apply", value
+            outcome_recorder=lambda value, operation_id: record_batch_outcome(
+                self.session, "apply", value, operation_id=operation_id
             ),
         )
         self.assertEqual(self.session.status(first.id), "verified")
@@ -364,8 +437,8 @@ class AdminScriptTest(unittest.TestCase):
             result_path,
             checksum,
             trusted_home=self.home,
-            outcome_recorder=lambda value: record_batch_outcome(
-                self.session, "apply", value
+            outcome_recorder=lambda value, operation_id: record_batch_outcome(
+                self.session, "apply", value, operation_id=operation_id
             ),
         )
         reloaded = Session.load(self.session.path)

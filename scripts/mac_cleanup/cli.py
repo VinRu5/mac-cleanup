@@ -259,8 +259,8 @@ def _apply(session_path: Path, batch_id: str, dry_run: bool, home: Path) -> int:
                 session,
                 batch,
                 roots,
-                outcome_recorder=lambda value: record_batch_outcome(
-                    session, "apply", value
+                outcome_recorder=lambda value, operation_id: record_batch_outcome(
+                    session, "apply", value, operation_id=operation_id
                 ),
             )
             _print_json(_outcome_summary("apply", outcome))
@@ -315,8 +315,8 @@ def _verify(session_path: Path, batch_id: str, home: Path) -> int:
                         result_path,
                         checksum,
                         trusted_home=home,
-                        outcome_recorder=lambda value: record_batch_outcome(
-                            session, "apply", value
+                        outcome_recorder=lambda value, operation_id: record_batch_outcome(
+                            session, "apply", value, operation_id=operation_id
                         ),
                     )
                 except SessionConsistencyError:

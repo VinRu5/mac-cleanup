@@ -344,7 +344,9 @@ class ExecutorTest(unittest.TestCase):
             self.session,
             batch,
             (self.allowed_root,),
-            outcome_recorder=lambda outcome: None,
+            outcome_recorder=lambda outcome, operation_id: record_batch_outcome(
+                self.session, "apply", outcome, operation_id=operation_id
+            ),
         )
         state_after_first = self.session.state
 
@@ -363,7 +365,9 @@ class ExecutorTest(unittest.TestCase):
             self.session,
             batch,
             (self.allowed_root,),
-            outcome_recorder=lambda outcome: None,
+            outcome_recorder=lambda outcome, operation_id: record_batch_outcome(
+                self.session, "apply", outcome, operation_id=operation_id
+            ),
         )
         recreated = Path(target.path)
         recreated.mkdir()
@@ -578,8 +582,8 @@ class ExecutorTest(unittest.TestCase):
                 self.session,
                 batch,
                 (self.allowed_root,),
-                outcome_recorder=lambda value: record_batch_outcome(
-                    self.session, "apply", value
+                outcome_recorder=lambda value, operation_id: record_batch_outcome(
+                    self.session, "apply", value, operation_id=operation_id
                 ),
             )
 
@@ -631,11 +635,16 @@ class ExecutorTest(unittest.TestCase):
         self._write_and_approve(batch)
         observed: list[dict[str, object]] = []
 
-        def record(outcome: object) -> None:
-            del outcome
+        def record(outcome: object, operation_id: str | None) -> object:
             intent = self.session.mutation_intent()
             self.assertIsNotNone(intent)
             observed.append(intent)  # type: ignore[arg-type]
+            return record_batch_outcome(
+                self.session,
+                "apply",
+                outcome,  # type: ignore[arg-type]
+                operation_id=operation_id,
+            )
 
         outcome = apply_batch(
             self.session,
@@ -647,6 +656,26 @@ class ExecutorTest(unittest.TestCase):
         self.assertFalse(outcome.suspended)
         self.assertEqual(len(observed), 1)
         self.assertIsNone(self.session.mutation_intent())
+
+    def test_noop_outcome_recorder_cannot_clear_direct_apply_intent(self) -> None:
+        target = self._target("cache-noop")
+        batch = Batch("safe-a", (target,))
+        self._write_and_approve(batch)
+
+        outcome = apply_batch(
+            self.session,
+            batch,
+            (self.allowed_root,),
+            outcome_recorder=lambda _value, _operation_id: None,
+        )
+
+        self.assertTrue(outcome.suspended)
+        self.assertIsNotNone(Session.load(self.session.path).mutation_intent())
+        self.assertFalse((self.session.path / "outcomes.json").exists())
+        self.assertIn(
+            "executor.outcome-publication-failed",
+            {issue.code for issue in outcome.issues},
+        )
 
     def test_post_delete_free_space_failure_is_conservative_and_keeps_intent(self) -> None:
         target = self._target("cache-a")
@@ -660,8 +689,8 @@ class ExecutorTest(unittest.TestCase):
                 self.session,
                 batch,
                 (self.allowed_root,),
-                outcome_recorder=lambda value: record_batch_outcome(
-                    self.session, "apply", value
+                outcome_recorder=lambda value, operation_id: record_batch_outcome(
+                    self.session, "apply", value, operation_id=operation_id
                 ),
             )
 
@@ -682,6 +711,15 @@ class ExecutorTest(unittest.TestCase):
         self._write_and_approve(batch)
         recorded: list[object] = []
 
+        def record(value: object, operation_id: str | None) -> object:
+            recorded.append(value)
+            return record_batch_outcome(
+                self.session,
+                "apply",
+                value,  # type: ignore[arg-type]
+                operation_id=operation_id,
+            )
+
         with patch.object(
             self.session,
             "clear_mutation_intent",
@@ -691,7 +729,7 @@ class ExecutorTest(unittest.TestCase):
                 self.session,
                 batch,
                 (self.allowed_root,),
-                outcome_recorder=recorded.append,
+                outcome_recorder=record,
             )
 
         self.assertEqual(len(recorded), 1)

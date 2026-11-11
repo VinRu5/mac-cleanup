@@ -1368,6 +1368,83 @@ class CliTest(unittest.TestCase):
                 ["apply", "verify"],
             )
 
+    def test_admin_verify_reconciles_post_replace_error_and_retry_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "admin-reconcile"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"cache")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:admin-reconcile",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            from scripts.mac_cleanup.admin_script import generate_admin_script
+
+            script_path = session.path / "admin.zsh"
+            generate_admin_script(
+                batch,
+                script_path,
+                session.path / "admin-result.json",
+                trusted_home=home,
+            )
+            completed = subprocess.run(
+                (str(script_path),), capture_output=True, text=True, check=False
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            writes = 0
+
+            def publish_then_fail(path: str | Path, value: object) -> None:
+                nonlocal writes
+                atomic_write_json(path, value)
+                if Path(path).name == "outcomes.json" and writes == 0:
+                    writes += 1
+                    raise OSError("simulated post-replace directory fsync failure")
+
+            with patch(
+                "scripts.mac_cleanup.reporting.atomic_write_json",
+                side_effect=publish_then_fail,
+            ):
+                first_code, first_output = self._run(
+                    ["verify", "--session", str(session.path), "--batch", batch.id],
+                    trusted_home=home,
+                )
+            self.assertEqual(first_code, 0, first_output)
+            self.assertIsNone(Session.load(session.path).mutation_intent())
+
+            retry_code, retry_output = self._run(
+                ["verify", "--session", str(session.path), "--batch", batch.id],
+                trusted_home=home,
+            )
+            self.assertEqual(retry_code, 0, retry_output)
+            operations = read_json(session.path / "outcomes.json")["operations"]
+            apply_operations = [
+                operation for operation in operations if operation["operation"] == "apply"
+            ]
+            self.assertEqual(len(apply_operations), 1)
+            self.assertEqual(
+                apply_operations[0]["logical_bytes_removed"], target.logical_bytes
+            )
+            self.assertEqual(
+                sum(
+                    operation["logical_bytes_removed"]
+                    for operation in apply_operations
+                ),
+                target.logical_bytes,
+            )
+
     def test_outcome_write_failure_after_delete_leaves_durable_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

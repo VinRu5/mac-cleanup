@@ -18,6 +18,7 @@ from typing import Mapping
 from .executor import BatchOutcome, _preflight_target
 from .jsonio import canonical_bytes, read_json
 from .models import Batch, Issue, Risk, Severity
+from .outcome_store import verify_outcome_receipt
 from .sessions import Session
 
 
@@ -464,7 +465,7 @@ def import_admin_results(
     expected_checksum: str,
     *,
     trusted_home: Path | None = None,
-    outcome_recorder: Callable[[BatchOutcome], None] | None = None,
+    outcome_recorder: Callable[[BatchOutcome, str | None], object] | None = None,
 ) -> BatchOutcome | None:
     """Post-validate artifacts/results and import verified filesystem outcomes."""
     if not isinstance(session, Session):
@@ -603,8 +604,16 @@ def import_admin_results(
             )
             if outcome_recorder is None:
                 return outcome
-            outcome_recorder(outcome)
-            session.clear_mutation_intent(str(intent["operation_id"]))
+            operation_id = str(intent["operation_id"])
+            receipt = outcome_recorder(outcome, operation_id)
+            verify_outcome_receipt(
+                session,
+                receipt,
+                operation="apply",
+                outcome=outcome,
+                operation_id=operation_id,
+            )
+            session.clear_mutation_intent(operation_id)
             return outcome
         _import_target_records(session, persisted, records, allowed_root)
         return None
