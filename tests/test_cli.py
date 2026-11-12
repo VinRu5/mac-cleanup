@@ -1445,6 +1445,83 @@ class CliTest(unittest.TestCase):
                 target.logical_bytes,
             )
 
+    def test_admin_verify_rejects_semantically_corrupt_prior_outcome_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            cache_root = home / "Library" / "Caches"
+            target_path = cache_root / "admin-corrupt-history"
+            target_path.mkdir(parents=True)
+            (target_path / "entry.bin").write_bytes(b"cache")
+            identity = inspect_path(target_path, (cache_root,))
+            target = Target(
+                id="user-caches:admin-corrupt-history",
+                path=identity.canonical,
+                kind=identity.kind,
+                risk=Risk.SAFE_REGENERABLE,
+                fingerprint=identity.fingerprint,
+                logical_bytes=identity.logical_bytes,
+            )
+            batch = Batch("safe-user-caches", (target,))
+            session = Session.create(root / "session")
+            session.write_manifest(
+                Manifest(batches=(batch,), inventory_digest="a" * 64)
+            )
+            session.transition(target.id, "approved")
+            from scripts.mac_cleanup.admin_script import generate_admin_script
+            from scripts.mac_cleanup.reporting import record_batch_outcome
+
+            record_batch_outcome(
+                session,
+                "apply",
+                BatchOutcome(
+                    batch_id=batch.id,
+                    logical_bytes_removed=target.logical_bytes,
+                    logical_bytes_removed_by_target=(
+                        (target.id, target.logical_bytes),
+                    ),
+                ),
+                operation_id="b" * 32,
+            )
+            outcomes_path = session.path / "outcomes.json"
+            corrupted = read_json(outcomes_path)
+            corrupted["operations"][0]["logical_bytes_removed_by_target"][0][
+                "target_id"
+            ] = "user-caches:outside-manifest"
+            atomic_write_json(outcomes_path, corrupted)
+            outcomes_before = outcomes_path.read_bytes()
+            script_path = session.path / "admin.zsh"
+            generate_admin_script(
+                batch,
+                script_path,
+                session.path / "admin-result.json",
+                trusted_home=home,
+            )
+            completed = subprocess.run(
+                (str(script_path),), capture_output=True, text=True, check=False
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            intent_before = Session.load(session.path).mutation_intent()
+            self.assertIsNotNone(intent_before)
+
+            code, output = self._run(
+                ["verify", "--session", str(session.path), "--batch", batch.id],
+                trusted_home=home,
+            )
+
+            self.assertEqual(code, 4, output)
+            self.assertEqual(outcomes_path.read_bytes(), outcomes_before)
+            self.assertEqual(
+                Session.load(session.path).mutation_intent(), intent_before
+            )
+            report_code, report_path = self._run(
+                ["report", "--session", str(session.path)], trusted_home=home
+            )
+            self.assertEqual(report_code, 4)
+            report = Path(report_path).read_text(encoding="utf-8")
+            self.assertIn("Removed logical bytes: unknown", report)
+            self.assertIn("executor.unresolved-mutation-intent", report)
+
     def test_outcome_write_failure_after_delete_leaves_durable_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

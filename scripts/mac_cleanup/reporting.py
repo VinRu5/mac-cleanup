@@ -16,6 +16,8 @@ from .outcome_store import (
     OutcomePublicationReceipt,
     outcome_operation_id,
     receipt_for_record,
+    validate_operations_membership,
+    validate_outcome_membership,
 )
 from .sessions import Session, SessionConsistencyError
 
@@ -59,7 +61,7 @@ def validate_outcome_history(session: Session) -> None:
         document = _read_outcome_document(session)
         operations = document["operations"]
         assert isinstance(operations, list)
-        _validate_operations_membership(manifest, operations)
+        validate_operations_membership(manifest, operations)
 
 
 def record_batch_outcome(
@@ -85,11 +87,12 @@ def record_batch_outcome(
         raise ValueError("outcome operation_id is invalid")
     with session.operation_lock():
         manifest = session.read_manifest()
-        _validate_outcome_membership(manifest, outcome)
+        validate_outcome_membership(manifest, outcome)
         path = _outcomes_path(session)
         document = _read_outcome_document(session)
         operations = document["operations"]
         assert isinstance(operations, list)
+        validate_operations_membership(manifest, operations)
         existing = [item for item in operations if item["operation_id"] == stable_id]
         if existing:
             if len(existing) != 1:
@@ -120,6 +123,7 @@ def record_batch_outcome(
             durable = _read_outcome_document(session)
             durable_operations = durable["operations"]
             assert isinstance(durable_operations, list)
+            validate_operations_membership(manifest, durable_operations)
             matches = [
                 item for item in durable_operations
                 if item["operation_id"] == stable_id
@@ -130,6 +134,7 @@ def record_batch_outcome(
         durable = _read_outcome_document(session)
         durable_operations = durable["operations"]
         assert isinstance(durable_operations, list)
+        validate_operations_membership(manifest, durable_operations)
         matches = [
             item for item in durable_operations if item["operation_id"] == stable_id
         ]
@@ -159,7 +164,7 @@ def _render_report_locked(session: Session, trusted_home: Path | None) -> str:
         else _read_outcome_document(session)["operations"]
     )
     assert isinstance(outcomes, list)
-    _validate_operations_membership(manifest, outcomes)
+    validate_operations_membership(manifest, outcomes)
     validations = (
         {}
         if intent is not None
@@ -507,55 +512,6 @@ def _validate_outcome(value: object, sequence: int, *, legacy: bool = False) -> 
     }
     if issue_uncertain != set(uncertain):
         raise ValueError("outcome uncertainty does not match its issues")
-
-
-def _validate_outcome_membership(manifest: Manifest, outcome: BatchOutcome) -> None:
-    batches = {batch.id: batch for batch in manifest.batches}
-    batch = batches.get(outcome.batch_id)
-    if batch is None:
-        raise ValueError("outcome names an unknown manifest batch")
-    target_ids = {target.id for target in batch.targets}
-    referenced = {
-        target_id for target_id, _ in outcome.logical_bytes_removed_by_target
-    } | set(outcome.regenerated_target_ids) | set(outcome.uncertain_target_ids) | {
-        issue.target_id for issue in outcome.issues if issue.target_id is not None
-    }
-    if not referenced.issubset(target_ids):
-        raise ValueError("outcome names a target outside its manifest batch")
-    if (
-        outcome.logical_bytes_removed is not None
-        and sum(count for _, count in outcome.logical_bytes_removed_by_target)
-        != outcome.logical_bytes_removed
-    ):
-        raise ValueError("outcome target removals do not equal its batch total")
-
-
-def _validate_operations_membership(
-    manifest: Manifest, operations: list[Mapping[str, Any]]
-) -> None:
-    batches = {batch.id: batch for batch in manifest.batches}
-    for operation in operations:
-        batch = batches.get(operation["batch_id"])
-        if batch is None:
-            raise ValueError("recorded outcome names an unknown manifest batch")
-        target_ids = {target.id for target in batch.targets}
-        removed = operation["logical_bytes_removed_by_target"]
-        referenced = {item["target_id"] for item in removed}
-        referenced.update(operation["regenerated_target_ids"])
-        referenced.update(operation["uncertain_target_ids"])
-        referenced.update(
-            issue["target_id"]
-            for issue in operation["issues"]
-            if isinstance(issue.get("target_id"), str)
-        )
-        if not referenced.issubset(target_ids):
-            raise ValueError("recorded outcome names a target outside its manifest batch")
-        if (
-            operation["logical_bytes_removed"] is not None
-            and sum(item["logical_bytes_removed"] for item in removed)
-            != operation["logical_bytes_removed"]
-        ):
-            raise ValueError("recorded target removals do not equal the batch total")
 
 
 def _admin_validations(

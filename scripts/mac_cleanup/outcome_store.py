@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .jsonio import canonical_bytes
+from .models import Manifest
 from .sessions import Session
 
 if TYPE_CHECKING:
@@ -20,6 +22,57 @@ class OutcomePublicationReceipt:
     operation_id: str
     sequence: int
     record_digest: str
+
+
+def validate_outcome_membership(manifest: Manifest, outcome: BatchOutcome) -> None:
+    """Ensure a candidate outcome only accounts for its immutable batch targets."""
+    batches = {batch.id: batch for batch in manifest.batches}
+    batch = batches.get(outcome.batch_id)
+    if batch is None:
+        raise ValueError("outcome names an unknown manifest batch")
+    target_ids = {target.id for target in batch.targets}
+    referenced = {
+        target_id for target_id, _ in outcome.logical_bytes_removed_by_target
+    } | set(outcome.regenerated_target_ids) | set(outcome.uncertain_target_ids) | {
+        issue.target_id for issue in outcome.issues if issue.target_id is not None
+    }
+    if not referenced.issubset(target_ids):
+        raise ValueError("outcome names a target outside its manifest batch")
+    if (
+        outcome.logical_bytes_removed is not None
+        and sum(count for _, count in outcome.logical_bytes_removed_by_target)
+        != outcome.logical_bytes_removed
+    ):
+        raise ValueError("outcome target removals do not equal its batch total")
+
+
+def validate_operations_membership(
+    manifest: Manifest, operations: list[Mapping[str, Any]]
+) -> None:
+    """Validate every persisted operation against the current immutable manifest."""
+    batches = {batch.id: batch for batch in manifest.batches}
+    for operation in operations:
+        batch = batches.get(operation["batch_id"])
+        if batch is None:
+            raise ValueError("recorded outcome names an unknown manifest batch")
+        target_ids = {target.id for target in batch.targets}
+        removed = operation["logical_bytes_removed_by_target"]
+        referenced = {item["target_id"] for item in removed}
+        referenced.update(operation["regenerated_target_ids"])
+        referenced.update(operation["uncertain_target_ids"])
+        referenced.update(
+            issue["target_id"]
+            for issue in operation["issues"]
+            if isinstance(issue.get("target_id"), str)
+        )
+        if not referenced.issubset(target_ids):
+            raise ValueError("recorded outcome names a target outside its manifest batch")
+        if (
+            operation["logical_bytes_removed"] is not None
+            and sum(item["logical_bytes_removed"] for item in removed)
+            != operation["logical_bytes_removed"]
+        ):
+            raise ValueError("recorded target removals do not equal the batch total")
 
 
 def outcome_operation_id(operation: str, outcome: BatchOutcome) -> str:
@@ -52,7 +105,6 @@ def verify_outcome_receipt(
     from .reporting import (
         _outcome_value,
         _read_outcome_document,
-        _validate_outcome_membership,
     )
 
     if not isinstance(receipt, OutcomePublicationReceipt):
@@ -66,10 +118,11 @@ def verify_outcome_receipt(
         raise ValueError("outcome receipt names a different operation")
     with session.operation_lock():
         manifest = session.read_manifest()
-        _validate_outcome_membership(manifest, outcome)
+        validate_outcome_membership(manifest, outcome)
         document = _read_outcome_document(session)
         operations = document["operations"]
         assert isinstance(operations, list)
+        validate_operations_membership(manifest, operations)
         matches = [
             item
             for item in operations

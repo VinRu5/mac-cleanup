@@ -9,6 +9,7 @@ from scripts.mac_cleanup.admin_script import generate_admin_script
 from scripts.mac_cleanup.executor import BatchOutcome
 from scripts.mac_cleanup.jsonio import atomic_write_json, read_json
 from scripts.mac_cleanup.models import Batch, Issue, Manifest, Risk, Severity, Target
+from scripts.mac_cleanup.outcome_store import verify_outcome_receipt
 from scripts.mac_cleanup.reporting import (
     AdministrativeArtifactError,
     record_batch_outcome,
@@ -592,6 +593,171 @@ class ReportingTest(unittest.TestCase):
         atomic_write_json(path, migrated)
         with self.assertRaises(ValueError):
             render_report(self.session)
+
+    def test_corrupt_prior_history_blocks_exact_retry_and_new_append(self) -> None:
+        target = Target(
+            id="user-caches:history",
+            path=str(self.root / "home" / "Library" / "Caches" / "history"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        batch_id = "safe-user-caches"
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch(batch_id, (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        removed = BatchOutcome(
+            batch_id=batch_id,
+            logical_bytes_removed=5,
+            logical_bytes_removed_by_target=((target.id, 5),),
+        )
+        empty = BatchOutcome(batch_id=batch_id)
+        record_batch_outcome(
+            self.session, "apply", removed, operation_id="6" * 32
+        )
+        record_batch_outcome(
+            self.session, "verify", empty, operation_id="7" * 32
+        )
+        path = self.session.path / "outcomes.json"
+        valid = read_json(path)
+
+        corrupted = copy.deepcopy(valid)
+        corrupted["operations"][0]["logical_bytes_removed_by_target"][0][
+            "target_id"
+        ] = "user-caches:outside-manifest"
+        atomic_write_json(path, corrupted)
+        before = path.read_bytes()
+        with self.assertRaises(ValueError):
+            record_batch_outcome(
+                self.session, "verify", empty, operation_id="7" * 32
+            )
+        self.assertEqual(path.read_bytes(), before)
+
+        mutations = {
+            "outside target": lambda item: item[
+                "logical_bytes_removed_by_target"
+            ][0].update(target_id="user-caches:outside-manifest"),
+            "inconsistent total": lambda item: item.update(
+                logical_bytes_removed=6
+            ),
+            "unknown batch": lambda item: item.update(batch_id="unknown-batch"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                corrupted = copy.deepcopy(valid)
+                mutate(corrupted["operations"][0])
+                atomic_write_json(path, corrupted)
+                before = path.read_bytes()
+                with self.assertRaises(ValueError):
+                    record_batch_outcome(
+                        self.session,
+                        "verify",
+                        empty,
+                        operation_id="8" * 32,
+                    )
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_reconciliation_revalidates_entire_durable_history(self) -> None:
+        target = Target(
+            id="user-caches:reconcile-history",
+            path=str(
+                self.root / "home" / "Library" / "Caches" / "reconcile-history"
+            ),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        batch_id = "safe-user-caches"
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch(batch_id, (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        record_batch_outcome(
+            self.session,
+            "apply",
+            BatchOutcome(
+                batch_id=batch_id,
+                logical_bytes_removed=5,
+                logical_bytes_removed_by_target=((target.id, 5),),
+            ),
+            operation_id="9" * 32,
+        )
+        path = self.session.path / "outcomes.json"
+        from scripts.mac_cleanup.jsonio import atomic_write_json as real_write
+
+        def publish_corrupt_history_then_fail(
+            destination: Path, value: object
+        ) -> None:
+            real_write(destination, value)
+            corrupt = read_json(destination)
+            corrupt["operations"][0]["batch_id"] = "unknown-batch"
+            real_write(destination, corrupt)
+            raise OSError("simulated post-replace failure")
+
+        with patch(
+            "scripts.mac_cleanup.reporting.atomic_write_json",
+            side_effect=publish_corrupt_history_then_fail,
+        ), self.assertRaises(ValueError):
+            record_batch_outcome(
+                self.session,
+                "verify",
+                BatchOutcome(batch_id=batch_id),
+                operation_id="a" * 32,
+            )
+
+    def test_receipt_verifier_rejects_unrelated_corrupt_history(self) -> None:
+        target = Target(
+            id="user-caches:receipt-history",
+            path=str(self.root / "home" / "Library" / "Caches" / "receipt-history"),
+            kind="directory",
+            risk=Risk.SAFE_REGENERABLE,
+            fingerprint="a" * 64,
+            logical_bytes=5,
+        )
+        batch_id = "safe-user-caches"
+        self.session.write_manifest(
+            Manifest(
+                batches=(Batch(batch_id, (target,)),),
+                inventory_digest="b" * 64,
+            )
+        )
+        record_batch_outcome(
+            self.session,
+            "apply",
+            BatchOutcome(
+                batch_id=batch_id,
+                logical_bytes_removed=5,
+                logical_bytes_removed_by_target=((target.id, 5),),
+            ),
+            operation_id="c" * 32,
+        )
+        candidate = BatchOutcome(batch_id=batch_id)
+        receipt = record_batch_outcome(
+            self.session,
+            "verify",
+            candidate,
+            operation_id="d" * 32,
+        )
+        path = self.session.path / "outcomes.json"
+        corrupted = read_json(path)
+        corrupted["operations"][0]["batch_id"] = "unknown-batch"
+        atomic_write_json(path, corrupted)
+
+        with self.assertRaises(ValueError):
+            verify_outcome_receipt(
+                self.session,
+                receipt,
+                operation="verify",
+                outcome=candidate,
+                operation_id="d" * 32,
+            )
 
     def test_unresolved_intent_report_ignores_missing_or_malformed_outcomes(self) -> None:
         target = Target(

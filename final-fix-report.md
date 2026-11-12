@@ -49,10 +49,18 @@
   or `outcome_recorder=None` cannot clear it. The administrative reviewer reproduction
   (post-replace directory-fsync error followed by retry) records removed bytes exactly
   once and clears only after the durable receipt is proven.
+- Full-history authorization: publication, exact-retry receipts, post-replacement
+  reconciliation, and independent receipt verification now validate every durable
+  operation against the current manifest before authorizing anything. A structurally
+  valid record with an unknown batch, an outside target, or inconsistent per-target
+  totals fails closed. Administrative resolution leaves both the intent and corrupt
+  outcome artifact untouched and reporting remains accounting-unknown. The shared
+  validator lives with outcome receipts rather than relying on reporting's private
+  API, keeping this cross-boundary check non-circular.
 
 ## Verification
 
-- Full suite after all changes: `python3 -m unittest discover -s tests` — 185 tests
+- Full suite after all changes: `python3 -m unittest discover -s tests` — 189 tests
   passed.
 - Integration suite: `python3 -m unittest tests.test_integration` — 2 tests passed.
 - Python compilation: every tracked Python file passed `py_compile`.
