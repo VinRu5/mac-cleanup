@@ -113,7 +113,7 @@ The action is included in the immutable manifest and approval digest. Supported
 action classes are:
 
 - `filesystem.remove_exact`, using the existing descriptor-relative remover;
-- a static vendor handler such as `homebrew.cleanup`, with typed parameters and an
+- a static vendor handler such as `android.sdkmanager-uninstall`, with typed parameters and an
   internally constructed argv;
 - no action for informational or `never_automatic` targets.
 
@@ -128,12 +128,16 @@ Batch identifiers are deterministic:
 <module-id>:<risk>:<authorization-boundary>
 ```
 
+The serialized risk token mapping is fixed: `safe_regenerable` becomes `safe`,
+`review_required` becomes `review`, and `never_automatic` has no token because it
+cannot enter an executable batch.
+
 Examples:
 
 - `xcode:safe:derived-data`;
-- `xcode:review:simulator-runtimes`;
+- `xcode:safe:xcode-cache`;
 - `gradle:safe:download-cache`;
-- `homebrew:review:vendor-cleanup`.
+- `npm:safe:content-cache`.
 
 Targets with different risks, action handlers, privilege requirements, active-use
 checks, or regeneration costs cannot share a batch. Approval is always for one exact
@@ -145,6 +149,10 @@ Inventory, target, action, manifest, policy, and report schemas will receive exp
 new versions. Existing `user-caches` sessions remain readable and resumable through
 strict deterministic migration. Old records are not reinterpreted as new module
 actions.
+
+Legacy approvals, manifests, intents, outcome histories, and administrative
+bindings retain their legacy schema and digest semantics until their session
+finishes. Migration never regenerates or promotes an existing approval digest.
 
 Migration must be atomic, idempotent, lock-protected, and covered by concurrency and
 post-replace failure tests.
@@ -164,26 +172,28 @@ No new cleanup target ships in this release.
 ### Release 1: Xcode and CoreSimulator
 
 Safe targets include canonical DerivedData and positively identified regenerable
-Xcode caches. Review targets may include obsolete device support and inactive
-simulator runtimes when their identity and active-use state are provable.
+Xcode caches. Device support and simulator runtimes remain inventory-only because
+identity and inactivity do not prove future obsolescence.
 
 Projects, archives, signing assets, provisioning profiles, keychains, active
 simulators, and simulator user data are `never_automatic`.
 
 ### Release 2: Flutter and FVM
 
-Separate downloadable Flutter artifacts and unreferenced FVM SDK versions from the
-currently selected SDK and project-referenced versions. Project directories,
-`pubspec.yaml`, lockfiles, credentials, and active SDKs are excluded.
+Separate downloadable Flutter artifacts from installed FVM SDK versions. Artifact
+caches may be executable; SDK versions are inventory-only because absence of
+references cannot be proved without scanning arbitrary projects. Project
+directories, `pubspec.yaml`, lockfiles, credentials, and active SDKs are excluded.
 
 ### Release 3: Gradle
 
-Cover reconstructible download caches and eligible inactive distributions. Preserve
-wrapper files, project `.gradle` state unless specifically designed later,
-configuration, credentials, signing material, and keystores.
+Cover reconstructible download caches and eligible inactive distributions. A
+distribution may be referenced by an unscanned project wrapper, so the module does
+not claim otherwise; it remains review-required because removal can force a later
+download. Preserve wrapper files, project `.gradle` state unless specifically
+designed later, configuration, credentials, signing material, and keystores.
 
-This release establishes reusable version-reference and active-process checks needed
-by Android.
+This release establishes reusable active-process checks needed by Android.
 
 ### Release 4: npm
 
@@ -194,24 +204,28 @@ tokens, or registry configuration. pnpm and Yarn require later independent modul
 ### Release 5: Android SDK, NDK, system images, and AVD inventory
 
 Treat SDK platforms, NDKs, build tools, and system images as component/version
-targets. Active or referenced components require review. AVD definitions and user
-data remain `never_automatic`; active emulator or ADB-related uncertainty blocks the
-batch. Discovery must not start ADB or an emulator.
+targets. Inactive components require review and use a typed exact-package SDK
+Manager handler; the module does not scan projects or claim components are
+unreferenced. AVD definitions and user data remain `never_automatic`; active emulator
+or ADB-related uncertainty blocks the batch. Discovery must not start ADB or an
+emulator.
 
 ### Release 6: Homebrew
 
-Use vendor read-only commands and `brew cleanup --dry-run` output. Only artifacts
-Homebrew explicitly identifies may enter a review batch. Apply uses a typed vendor
-handler, not filesystem deletion. Installed formulae, casks, taps, pins, and
-configuration remain preserved.
+Use vendor read-only commands and `brew cleanup --dry-run` output. Artifacts Homebrew
+identifies remain inventory-only: a generic cleanup command is not atomically bound
+to the exact dry-run artifact set and could widen after approval. Installed formulae,
+casks, taps, pins, and configuration remain preserved.
 
 Unrecognized output or unsupported Homebrew versions fail closed.
 
 ### Release 7: conservative Docker
 
-Include only regenerable build cache and clearly identified post-uninstallation
-residues. If Docker or related processes are active, the module produces no executable
-batch.
+Use a module-scoped `~/Library/Caches` capability and include only its exact immediate
+`com.docker.docker` child when Docker is conclusively inactive; never remove the
+trusted root itself. Do not infer an uninstall from application absence or receipts. Build
+cache remains report-only because discovery must not contact or start the daemon. If
+Docker or related processes are active, the module produces no executable batch.
 
 Always exclude volumes, containers, named images, contexts, credentials, Kubernetes
 state, and `Docker.raw`. The module must not start the Docker daemon to inspect it.
@@ -233,14 +247,14 @@ Every release must add the following layers.
 
 - Xcode/CoreSimulator: DerivedData, archives, device support, runtimes, active
   simulator, and simulator user data.
-- Flutter/FVM: installed versions, selected version, symlinks, project references,
+- Flutter/FVM: installed versions, selected version, symlinks, bounded metadata,
   and downloaded artifacts.
 - Gradle: downloads, distributions, wrappers, configuration, credentials, and
   keystores.
 - npm: cache, corrupt cache, projects, `node_modules`, lockfiles, and `.npmrc`.
 - Android: SDK/NDK/system-image versions, AVDs, user data, and mocked active emulator.
 - Homebrew: recorded dry-run output, pinned formulae, unsupported output, and timeout.
-- Docker: active/inactive process state, build cache, post-uninstall residue, volumes,
+- Docker: active/inactive process state, build cache, fixed user cache, volumes,
   images, containers, and `Docker.raw` exclusions.
 
 ### Adversarial tests
